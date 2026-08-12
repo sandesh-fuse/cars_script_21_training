@@ -1,0 +1,52 @@
+{
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
+        "json": {
+            "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+            "fmt": "%(asctime)s %(levelname)s %(name)s %(message)s",
+            "rename_fields": {
+                "levelname": "level",
+                "asctime": "timestamp"
+            },
+            "datefmt": "%Y-%m-%dT%H:%M:%SZ"
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "json"
+        }
+    },
+    "loggers": {
+        "car-sale-value-predictor": {
+            "handlers": [
+                "console"
+            ],
+            "level": "DEBUG",
+            "propagate": false
+        },
+        "uvicorn": {
+            "handlers": [
+                "console"
+            ],
+            "level": "DEBUG",
+            "propagate": false
+        },
+        "uvicorn.error": {
+            "handlers": [
+                "console"
+            ],
+            "level": "DEBUG",
+            "propagate": false
+        },
+        "uvicorn.access": {
+            "handlers": [
+                "console"
+            ],
+            "level": "DEBUG",
+            "propagate": false
+        }
+    }
+}

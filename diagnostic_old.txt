@@ -1,0 +1,158 @@
+
+==========================================================================================
+DATASET DIAGNOSTIC: May27_combined_dataone_cars_data_with_specialty_item_removed.csv
+==========================================================================================
+Full path: C:\Users\pradi\Pradip\Fusemachines\cars\data\May27_combined_dataone_cars_data_with_specialty_item_removed.csv
+File size: 1637.5 MB
+
+Loading...
+Loaded 859,830 rows × 127 columns
+
+==========================================================================================
+1. SHAPE & SCHEMA
+==========================================================================================
+Rows: 859,830
+Columns: 127
+Memory: 5.31 GB
+
+Columns present from KEY_FEATURES list:
+  Present (25): ['stock_id', 'vin', 'record_creation_date', 'salevalue', 'salesrevenue', 'make', 'model', 'year', 'mileage', 'body_type', 'vehicle_type', 'nav_make', 'nav_model', 'nav_year', 'nav_condition', 'bodypaintcondition', 'enginecondition', 'transmissioncondition', 'tirecondition', 'interiorcondition', 'dsrating', 'vazipcode', 'vcity', 'stateprovinceofregistration', 'state_province_of_title']
+  Missing (1): ['vstate']
+
+==========================================================================================
+2. TARGET (salevalue) DISTRIBUTION — OVERALL
+==========================================================================================
+  Total rows: 859,830
+  Salevalue null: 151,789 ( 17.7%)
+  Salevalue valid: 708,041 ( 82.3%)
+  Salevalue > 0: 707,738 ( 82.3%)
+  Salevalue = 0: 303
+  Salevalue < 0: 0 (probably bad data if non-zero)
+
+  Statistics (on non-null):
+    min:    $0.00
+    p1:     $55
+    p5:     $125
+    p25:    $300
+    p50:    $550
+    p75:    $1200
+    p95:    $3300
+    p99:    $6500
+    p99.5:  $8400
+    p99.9:  $15274
+    max:    $193000
+    mean:   $1015
+
+==========================================================================================
+3. TARGET DISTRIBUTION BY YEAR / YEAR-MONTH
+==========================================================================================
+
+Records by year (count, count_with_target, null_rate):
+  2024: n=  84,945  target_present=  68,420  null_rate= 19.5%  mean_y=$1298
+  2025: n=  92,493  target_present=  75,443  null_rate= 18.4%  mean_y=$1291
+  2026: n=  18,431  target_present=   9,223  null_rate= 50.0%  mean_y=$1432
+
+Last 6 year-months (test window candidates):
+  2025-12: n= 8,291  target_present= 6,740  null_rate= 18.7%  mean_y=$1280
+  2026-01: n= 6,148  target_present= 4,874  null_rate= 20.7%  mean_y=$1438
+  2026-02: n= 3,111  target_present= 2,456  null_rate= 21.1%  mean_y=$1533
+  2026-03: n=   182  target_present=   134  null_rate= 26.4%  mean_y=$1395
+  2026-04: n= 6,455  target_present= 1,755  null_rate= 72.8%  mean_y=$1276
+  2026-05: n= 2,535  target_present=     4  null_rate= 99.8%  mean_y=$395
+
+==========================================================================================
+4. KEY FEATURE NULL RATES
+==========================================================================================
+
+Null rate (per feature, full dataset):
+  feature                             n_null      pct       dtype
+  stock_id                                 0     0.0%      object
+  vin                                      0     0.0%      object
+  record_creation_date                     4     0.0%      object
+  salevalue                          151,789    17.7%     float64
+  salesrevenue                       706,744    82.2%     float64
+  make                               207,199    24.1%      object
+  model                              207,749    24.2%      object
+  year                               207,199    24.1%     float64
+  mileage                              3,662     0.4%     float64
+  body_type                          198,942    23.1%      object
+  vehicle_type                       198,939    23.1%      object
+  nav_make                                47     0.0%      object
+  nav_model                              131     0.0%      object
+  nav_year                                74     0.0%     float64
+  nav_condition                        6,287     0.7%      object
+  bodypaintcondition                   6,821     0.8%      object
+  enginecondition                      6,658     0.8%      object
+  transmissioncondition                6,748     0.8%      object
+  tirecondition                        6,954     0.8%      object
+  interiorcondition                    6,957     0.8%      object
+  dsrating                           693,769    80.7%      object
+  vazipcode                           52,651     6.1%      object
+  vcity                               52,739     6.1%      object
+  stateprovinceofregistration         10,496     1.2%      object
+  state_province_of_title             10,511     1.2%      object
+
+==========================================================================================
+5. vazipcode DEEP DIVE
+==========================================================================================
+  Raw null: 52,651 (  6.1%)
+  Empty string: 0
+  Literal 'nan' string: 52,651
+  Ending in '.0' (float-cast artifact): 231,719 ( 26.9%)
+  Length distribution (non-blank):
+    len=1: 1
+    len=3: 2
+    len=4: 14,826
+    len=5: 560,158
+    len=6: 21,779
+    len=7: 210,410
+    len=10: 3
+  vazipcode null rate by year:
+    2024: 821/84,945 (1.0%)
+    2025: 20,759/92,493 (22.4%)
+    2026: 18,431/18,431 (100.0%)
+
+==========================================================================================
+6. nav_* / PRIMARY FIELD AGREEMENT
+==========================================================================================
+
+  (nav_make, make):
+    both present:  652,631  ( 75.9%)
+    of which agree:  652,626 disagree:        5
+    nav_make only:  207,152  ( 24.1%)
+    make only:        0  (  0.0%)
+    both null:       47  (  0.0%)
+
+  (nav_model, model):
+    both present:  652,081  ( 75.8%)
+    of which agree:  651,890 disagree:      191
+    nav_model only:  207,617  ( 24.1%)
+    model only:        0  (  0.0%)
+    both null:      132  (  0.0%)
+
+  (nav_year, year):
+    both present:  652,610  ( 75.9%)
+    of which agree:  652,588 disagree:       22
+    nav_year only:  207,146  ( 24.1%)
+    year only:       21  (  0.0%)
+    both null:       53  (  0.0%)
+
+==========================================================================================
+7. TRAIN / TEST SPLIT SUMMARY
+==========================================================================================
+  No valid rows in the window — cap-pct/min-salevalue may be excluding everything.
+
+==========================================================================================
+8. CAP IMPACT AT VARIOUS PERCENTILES
+==========================================================================================
+  (computed on 707,738 rows where salevalue > 0)
+  cap = p 99.0  =>  $    6500   drops  6,914 rows (0.98%)
+  cap = p 99.5  =>  $    8400   drops  3,480 rows (0.49%)
+  cap = p 99.9  =>  $   15282   drops    708 rows (0.10%)
+  cap = p99.99  =>  $   33102   drops     71 rows (0.01%)
+  cap = p100.0  =>  none      drops 0 rows (full range kept)
+
+==========================================================================================
+END OF DIAGNOSTIC
+==========================================================================================
+

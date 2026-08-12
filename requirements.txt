@@ -1,0 +1,22 @@
+# Core ML
+xgboost>=2.0,<4.0
+scikit-learn>=1.3,<2.0
+shap>=0.44,<0.55
+joblib>=1.3
+numpy>=1.24,<3.0
+pandas>=2.0,<3.0
+pyarrow>=14.0          # for parquet sample_test_rows
+openpyxl>=3.1          # to read cult_cars.xlsx
+pgeocode>=0.4          # ZIP -> lat/lon at training time
+
+# Web service
+fastapi>=0.104,<1.0
+uvicorn[standard]>=0.24
+pydantic>=2.0,<3.0
+requests>=2.31
+
+python-json-logger==4.1.0
+httpx==0.28.1
+
+# Optional: only needed for retraining inside container
+# optuna>=3.4

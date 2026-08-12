@@ -1,0 +1,138 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django/FastAPI/SQLAlchemy migrations
+# (Uncomment if you use a separate DB migration folder in your project root)
+# */migrations/
+
+# Environments & Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs & Editor specific files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.pydevproject
+.project
+.pyproj
+.hg
+*.swp
+*.swo
+*~
+*.kcrash
+.DS_Store
+
+# Logs & Databases
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+
+# Local Configuration (Secrets, keys, DB passwords)
+.env.*
+!.env.example
+
+# ==========================================
+# Machine Learning Specific (Keep your data private)
+# ==========================================
+
+# Model Checkpoints & Weights
+*.pt
+*.pth
+*.pb
+*.hdf5
+*.h5
+*.keras
+*.onnx
+*.weights
+*.ckpt
+*.joblib
+*.pkl
+
+# ML Datasets & Processed Files
+data/
+dataset/
+datasets/
+cache/
+processed/
+raw/
+output/
+runs/
+logs/
+mlruns/
+wandb/
+
+# TensorBoard logs
+tfevents-*
+events.out.tfevents.*
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+artifacts/script21/
+*.csv

@@ -1,0 +1,19 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.git
+.gitignore
+.env
+.venv
+venv/
+.vscode
+.idea
+*.log
+.pytest_cache
+.DS_Store
+README.md
+artifacts/         # mounted as volume at runtime
+tests/             # not needed at runtime
