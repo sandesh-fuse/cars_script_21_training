@@ -34,6 +34,7 @@ NEW_TO_OLD_SCHEMA_MAP = {
     "interior_cond_picklist_id_name": "interiorcondition",
     "tire_cond_picklist_id_name": "tirecondition",
     "color": "nav_color",
+    "zip" : "vazipcode",
 
     # --- Engine & drivetrain ---
     "engines_name": "engine_name",             # regex-parsed for HP/displacement/etc. downstream
