@@ -42,6 +42,7 @@ from schema_adapter import map_raw_features_to_legacy, filter_to_known_columns
 from shap_dollar_helper import sanity_check_shap
 from _save_predictions_helper import build_predictions_frame, save_predictions
 from evaluate_predictions import evaluate
+from timewise_breakdown import run_timewise_breakdown
 
 # ============================================================
 # CONFIG
@@ -62,6 +63,25 @@ STANDARD_CONFIG = {
     'alpha': 0.02390014731569895,
     'use_macro': True, 'use_geo': True, 'use_cult': False,
 }
+
+# Features requested for exclusion from script21's training set. Resolved via
+# schema_adapter.NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the
+# preprocessor actually sees (raw incoming DB field name -> legacy name in the
+# comments below). script21-only: preprocessor.py's shared class defaults
+# (used by script17 too) are untouched; this list is passed in per-instance
+# via SaleValuePreprocessor(extra_drop_cols=...).
+SCRIPT21_EXCLUDED_FEATURES = [
+    'oem_body_style',       # raw 'body_type'          -> legacy 'oem_body_style'
+    'drive_type',           # raw 'drive_type'         -> legacy 'drive_type' (no rename)
+    'engine_name',          # raw 'engines_name'       -> legacy 'engine_name'
+    'engineconfiguration',  # raw 'ice_block_type'     -> legacy 'engineconfiguration'
+    'enginecylinders',      # raw 'ice_cylinders'      -> legacy 'enginecylinders'
+    'displacementl',        # raw 'ice_displacement'   -> legacy 'displacementl'
+    'enginehp',             # raw 'ice_max_hp'         -> legacy 'enginehp'
+    'msrp',                 # raw 'msrp'               -> legacy 'msrp' (no rename)
+    'transmission_name',    # raw 'transmissions_name' -> legacy 'transmission_name'
+    'us_style_name',        # raw 'us_styles'          -> legacy 'us_style_name'
+]
 
 DEFAULT_PARAMS_CULT = {
     "q05": dict(learning_rate=0.03, max_depth=8, min_child_weight=20,
@@ -190,6 +210,7 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         use_macro=config['use_macro'], use_geo=config['use_geo'], use_cult=config['use_cult'],
         with_target_encoding=False,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
+        extra_drop_cols=SCRIPT21_EXCLUDED_FEATURES,
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -525,6 +546,13 @@ def main():
              save_json_to=os.path.join(args.out, "train_metrics.json"), verbose=True)
     evaluate(test_pred_df,  label="script21_test",
              save_json_to=os.path.join(args.out, "test_metrics.json"),  verbose=True)
+
+    # ----- Timewise breakdown (weekly/monthly accuracy trend + monthly sample exports) -----
+    # Uses test_pred_df only (not train) for the same reason evaluate() above does:
+    # train predictions are optimistic since the model saw those rows during training.
+    print("\nComputing timewise breakdown (weekly/monthly metrics + monthly samples)...")
+    timewise_dir = os.path.join(args.out, "timewise_breakdown")
+    run_timewise_breakdown(test_pred_df, timewise_dir)
 
     # ----- Optional SHAP exports -----
     want_per_row = args.save_shap

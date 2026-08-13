@@ -1,0 +1,149 @@
+SCRIPT21 FEATURE REMOVAL AUDIT
+Date: 2026-08-13
+Scope: script21 ONLY (train_save_script21.py / artifacts/script21/).
+       preprocessor.py's shared class defaults are untouched, so script17
+       (train_save_script17.py / artifacts/script17/) is NOT affected and
+       does NOT need to be retrained because of this change.
+
+Requested list (26 raw DB-export column names):
+vin, http_code, api_latency_seconds, body_type, country_of_manufacture,
+dataone_vehicle_ids, drive_type, engines_name, error_messages, fuel_type,
+gears, ice_block_type, ice_cylinders, ice_displacement, ice_displacement_cc,
+ice_max_hp, ice_max_torque, market, msrp, plant, restraint_type,
+total_styles, transaction_id, transmission_type, transmissions_name,
+us_styles
+
+Each name was resolved through schema_adapter.py's NEW_TO_OLD_SCHEMA_MAP to
+the LEGACY column name preprocessor.py actually operates on (new-schema
+columns get renamed to legacy names by map_raw_features_to_legacy() before
+preprocessor.py ever sees the data).
+
+--------------------------------------------------------------------------
+GROUP 1 — WAS ACTUALLY USED AS A FEATURE -> NOW REMOVED (script21 only)
+--------------------------------------------------------------------------
+Enforced via a new SaleValuePreprocessor(extra_drop_cols=...) hook, passed
+in from train_save_script21.py's SCRIPT21_EXCLUDED_FEATURES list.
+
+  Requested name        Resolves to (legacy)    How it was used
+  ---------------        ---------------------   ----------------------------
+  body_type              oem_body_style          frequency-encoded raw feature
+  drive_type             drive_type (no rename)  raw feature; body_x_drive
+                                                  interaction; vehicle-profile
+                                                  cluster attribute
+  engines_name           engine_name             frequency-encoded raw
+                                                  feature; source string used
+                                                  to parse engine specs
+  ice_block_type         engineconfiguration     frequency-encoded; feeds
+                                                  engineconfig_x_make
+  ice_cylinders          enginecylinders         raw numeric feature; feeds
+                                                  enginecylinders_x_make
+  ice_displacement       displacementl           raw numeric feature; feeds
+                                                  displacementl_x_age
+  ice_max_hp             enginehp                raw numeric feature; feeds
+                                                  enginehp_bucket /
+                                                  enginehp_bkt_x_age_bkt
+  msrp                   msrp (no rename)        raw numeric feature (was
+                                                  passed straight through —
+                                                  not previously in any drop
+                                                  list)
+  transmissions_name     transmission_name       frequency-encoded raw
+                                                  feature
+  us_styles              us_style_name           frequency-encoded raw
+                                                  feature
+
+NOTE on "body_type": the incoming new-schema field "body_type" renames to
+legacy "oem_body_style" (removed above). A DIFFERENT legacy column, also
+called "body_type", is fed by the incoming "vehicle_category" field and
+represents vehicle category (not requested for removal) — it is used in
+make_x_body_type, body_x_drive (drive_type side), zip_region_x_body_type,
+and vehicle-profile clustering, and was intentionally left untouched.
+
+Side effects (derived/engineered columns that will simply stop being
+created once their source column above is gone — all guarded by existing
+"if column present" checks in preprocessor.py, so nothing crashes):
+  - body_x_drive (and its _freq encoding)
+  - engineconfig_x_make, engineconfig_x_make_freq
+  - enginecylinders_x_make, enginecylinders_x_make_freq
+  - enginehp_bucket, enginehp_bkt_x_age_bkt, enginehp_bkt_x_age_bkt_freq
+  - displacementl_x_age
+  - valvetraindesign, valvetraindesign_freq, engineconfiguration_freq
+    (these were only ever parsed out of engine_name, which is now dropped
+    before that parsing step runs)
+
+--------------------------------------------------------------------------
+GROUP 2 — NOT USED -> ALREADY EXCLUDED, NO CODE CHANGE NEEDED
+--------------------------------------------------------------------------
+  vin                   Already hard-dropped in preprocessor.py's
+                        DROP_COLS_NO_ZIP (also vin_hin_no / vinhinno).
+  restraint_type        Not a recognized raw column at all (not in
+                        schema_adapter's map, not a PredictRequest field) —
+                        filtered out before the pipeline sees it. Also
+                        already redundantly listed in DROP_COLS_NO_ZIP.
+  http_code             Not a recognized raw column (dropped by
+  api_latency_seconds   schema_adapter.filter_to_known_columns() before
+  country_of_manufacture  the pipeline ever sees these — none of them are a
+  dataone_vehicle_ids   NEW_TO_OLD_SCHEMA_MAP key/value or a PredictRequest
+  error_messages        field).
+  fuel_type
+  gears
+  ice_displacement_cc
+  ice_max_torque
+  market
+  plant
+  total_styles
+  transaction_id
+  transmission_type
+
+--------------------------------------------------------------------------
+FILES CHANGED
+--------------------------------------------------------------------------
+  preprocessor.py         - Added optional extra_drop_cols=None param to
+                            SaleValuePreprocessor.__init__ (default keeps
+                            script17 behavior identical).
+                          - _basic_clean() now also drops self.extra_drop_cols
+                            alongside USER_DROP_COLS / DROP_COLS_NO_ZIP.
+  train_save_script21.py - Added SCRIPT21_EXCLUDED_FEATURES list (the 10
+                            Group 1 legacy names).
+                          - train_subset_with_quantiles() now passes
+                            extra_drop_cols=SCRIPT21_EXCLUDED_FEATURES into
+                            SaleValuePreprocessor for both the CULT and
+                            STANDARD routes.
+  schema_adapter.py       - NOT modified. Its rename map must stay intact
+                            (e.g. vehicle_category -> body_type and the
+                            ice_* renames are still needed for other
+                            purposes), and removing a map entry risks
+                            tripping the collision check in
+                            map_raw_features_to_legacy(). Exclusion is
+                            enforced at the preprocessor drop-list layer
+                            instead.
+
+Not modified (checked, no crash risk, left alone as out of scope):
+  app/schemas.py              - PredictRequest still declares these fields;
+                                 API callers can still send them, they will
+                                 just be silently unused by script21 (all
+                                 fields are Optional; extra="allow").
+  app/feature_descriptions.py - Human-readable labels for these features
+                                 become dead/unused entries (dict .get()
+                                 lookups, no crash).
+  app/raw_feature_mapping.py  - SHAP raw-feature-grouping entries for these
+                                 features become dead/unused entries ("in"
+                                 checks, no crash).
+  app/inference_script21.py   - No changes needed: extra_drop_cols is a
+                                 stored attribute on the fitted
+                                 SaleValuePreprocessor, so it is pickled
+                                 into preprocessor_cult.joblib /
+                                 preprocessor_standard.joblib and applied
+                                 automatically at inference time once the
+                                 model below is retrained.
+
+--------------------------------------------------------------------------
+ACTION REQUIRED
+--------------------------------------------------------------------------
+This change only affects the NEXT training run. Existing artifacts in
+artifacts/script21/ still reflect the old feature set until you retrain:
+
+    python train_save_script21.py
+    # or, for a production-grade retune:
+    python train_save_script21.py --retune --n_trials 50 --gpu
+
+artifacts/script17/ is unaffected and does not need retraining.

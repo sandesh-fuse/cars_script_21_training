@@ -332,7 +332,8 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                  use_macro=False, use_geo=False, use_cult=False,
                  with_target_encoding=False, smoothing=20, n_folds=5,
                  zip_lat_map=None, zip_lon_map=None, cult_lookup=None,
-                 n_clusters=12, cluster_min_samples=50):
+                 n_clusters=12, cluster_min_samples=50,
+                 extra_drop_cols=None):
         self.time_col = time_col
         self.seed     = seed
         self.use_macro = use_macro
@@ -344,6 +345,11 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         self.zip_lat_map = zip_lat_map or {}
         self.zip_lon_map = zip_lon_map or {}
         self.cult_lookup = cult_lookup or {}
+        # Caller-supplied extra columns to hard-drop, on top of USER_DROP_COLS /
+        # DROP_COLS_NO_ZIP. Lets one pipeline (e.g. script21) exclude features
+        # without changing the shared class defaults other callers (script17)
+        # rely on. Empty by default -> zero behavior change for existing callers.
+        self.extra_drop_cols = list(extra_drop_cols) if extra_drop_cols else []
         self.TARGET_ENC_COLS = self.TARGET_ENC_COLS_ALL if with_target_encoding else []
         # Vehicle-profile clustering: K-means on (make, model) attribute vectors.
         # NOTE: clusters are NOT fit on salevalue — zero target leakage. They group
@@ -602,7 +608,9 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # Step 2: drop the user-specified columns + the legacy drop list.
         # USER_DROP_COLS includes engineered features (dsrating_num,
         # has_dsrating) that no longer make sense without the source column.
-        all_drops = list(self.USER_DROP_COLS) + list(
+        # extra_drop_cols is caller-supplied (see __init__) and lets a single
+        # pipeline exclude features without touching the shared class defaults.
+        all_drops = list(self.USER_DROP_COLS) + list(self.extra_drop_cols) + list(
             self.DROP_COLS_NO_ZIP if self.use_geo else self.DROP_COLS_WITH_ZIP_DROP
         )
         X = X.drop(columns=[c for c in all_drops if c in X.columns])
