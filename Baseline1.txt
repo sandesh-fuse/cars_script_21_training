@@ -1,0 +1,87 @@
+======================================================================
+FINAL ROUTED QUANTILE PREDICTIONS
+======================================================================
+
+Empirical coverage (90% CI):    89.6%   (target: 90%)
+Point (median) MAE:              $516.73
+Point (median) RMSE:             $889.27
+Point (median) RMSLE:            0.6033
+Median width of 90% CI:          $1890
+Mean width of 90% CI:            $2418
+
+--- BY ROUTE ---
+  Cult (n=528): MAE_p50=$605  RMSLE_p50=0.6494  Cov_90=88.4%  Mean_Width=$2442
+  Non-cult (n=13357): MAE_p50=$513  RMSLE_p50=0.6014  Cov_90=89.6%  Mean_Width=$2417
+
+Tier            N    MAE_p50  RMSLE_p50   Cov_90   Mean_Width
+$0-200        573 $     226     1.1436    61.3% $      1178
+$200-500     4868 $     234     0.5671    86.1% $      1479
+$500-1K      3430 $     333     0.4869    96.2% $      2103
+$1K-2.5K     3354 $     584     0.5375    96.0% $      2950
+$2.5K+       1660 $    1689     0.7591    82.8% $      5177
+
+--- SHAP sanity check (median models) ---
+/home/wsuser/work/cars_script_21_training/preprocessor.py:439: FutureWarning: Downcasting behavior in `replace` is deprecated and will be removed in a future version. To retain the old behavior, explicitly call `result.infer_objects(copy=False)`. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  X['valvetraindesign'] = X['valvetraindesign'].replace({'': np.nan, None: np.nan})
+  [CULT-q50] Running SHAP sanity check on 3 samples...
+    Row 0: base=$749  final=$788  marginal_sum=$80  residual=$-41  log_diff=0.00000
+    Row 1: base=$749  final=$474  marginal_sum=$-288  residual=$13  log_diff=0.00000
+    Row 2: base=$749  final=$1993  marginal_sum=$886  residual=$358  log_diff=0.00000
+  [STANDARD-q50] Running SHAP sanity check on 3 samples...
+    Row 0: base=$627  final=$352  marginal_sum=$-326  residual=$51  log_diff=0.00000
+    Row 1: base=$627  final=$1105  marginal_sum=$455  residual=$23  log_diff=0.00001
+    Row 2: base=$627  final=$1300  marginal_sum=$499  residual=$174  log_diff=0.00001
+
+Saving artifacts to ./artifacts/script21/ ...
+
+--- Computing train predictions (full set) for save ---
+
+Saving prediction files...
+  Saved: ./artifacts/script21/train_predictions.parquet  (672,019 rows)
+  Saved: ./artifacts/script21/train_predictions.csv
+  Saved: ./artifacts/script21/test_predictions.parquet  (13,885 rows)
+  Saved: ./artifacts/script21/test_predictions.csv
+====================================================================================================
+METRICS — script21_train  (n=672,019)
+====================================================================================================
+  OVERALL         N=672,019  MAE=$    343  RMSE=$    672  RMSLE=0.5285  Cov90= 89.9%  Width=$   1664  Bias=$   -125
+
+By price tier:
+  $0-200          N=81,723  MAE=$    109  RMSE=$    184  RMSLE=0.8148  Cov90= 77.6%  Width=$    720  Bias=$   +104
+  $200-500        N=225,748  MAE=$    133  RMSE=$    239  RMSLE=0.4137  Cov90= 93.2%  Width=$   1027  Bias=$    +97
+  $500-1K         N=158,885  MAE=$    216  RMSE=$    343  RMSLE=0.3968  Cov90= 96.1%  Width=$   1492  Bias=$    +16
+  $1K-2.5K        N=144,841  MAE=$    512  RMSE=$    671  RMSLE=0.5312  Cov90= 89.9%  Width=$   2282  Bias=$   -307
+  $2.5K-4K        N=39,121  MAE=$   1060  RMSE=$   1319  RMSLE=0.6504  Cov90= 80.7%  Width=$   3588  Bias=$   -877
+  $4K-6K          N=15,137  MAE=$   1633  RMSE=$   2063  RMSLE=0.7201  Cov90= 75.7%  Width=$   4988  Bias=$  -1450
+  $6K-10K         N= 6,564  MAE=$   2588  RMSE=$   3295  RMSLE=0.8302  Cov90= 65.5%  Width=$   6701  Bias=$  -2453
+  $10K-15K        N=0  (no rows)
+  $15K-25K        N=0  (no rows)
+  $25K+           N=0  (no rows)
+
+By route (cult / non-cult):
+  cult            N=26,781  MAE=$    409  RMSE=$    784  RMSLE=0.5602  Cov90= 90.6%  Width=$   1933  Bias=$   -171
+  non_cult        N=645,238  MAE=$    340  RMSE=$    667  RMSLE=0.5271  Cov90= 89.8%  Width=$   1653  Bias=$   -123
+
+
+  Metrics JSON written to: ./artifacts/script21/train_metrics.json
+====================================================================================================
+METRICS — script21_test  (n=13,885)
+====================================================================================================
+  OVERALL         N=13,885  MAE=$    517  RMSE=$    889  RMSLE=0.6033  Cov90= 89.6%  Width=$   2418  Bias=$   -104
+
+By price tier:
+  $0-200          N=   573  MAE=$    226  RMSE=$    346  RMSLE=1.1436  Cov90= 61.3%  Width=$   1178  Bias=$   +223
+  $200-500        N= 4,868  MAE=$    234  RMSE=$    382  RMSLE=0.5671  Cov90= 86.1%  Width=$   1479  Bias=$   +208
+  $500-1K         N= 3,430  MAE=$    333  RMSE=$    520  RMSLE=0.4869  Cov90= 96.2%  Width=$   2103  Bias=$   +159
+  $1K-2.5K        N= 3,354  MAE=$    584  RMSE=$    763  RMSLE=0.5375  Cov90= 96.0%  Width=$   2950  Bias=$   -219
+  $2.5K-4K        N=   984  MAE=$   1236  RMSE=$   1464  RMSLE=0.7053  Cov90= 87.0%  Width=$   4384  Bias=$   -969
+  $4K-6K          N=   453  MAE=$   2006  RMSE=$   2305  RMSLE=0.7860  Cov90= 79.9%  Width=$   5758  Bias=$  -1780
+  $6K-10K         N=   223  MAE=$   3047  RMSE=$   3545  RMSLE=0.9164  Cov90= 70.4%  Width=$   7496  Bias=$  -2846
+  $10K-15K        N=0  (no rows)
+  $15K-25K        N=0  (no rows)
+  $25K+           N=0  (no rows)
+
+By route (cult / non-cult):
+  cult            N=   528  MAE=$    605  RMSE=$   1036  RMSLE=0.6494  Cov90= 88.4%  Width=$   2442  Bias=$     +9
+  non_cult        N=13,357  MAE=$    513  RMSE=$    883  RMSLE=0.6014  Cov90= 89.6%  Width=$   2417  Bias=$   -108
+

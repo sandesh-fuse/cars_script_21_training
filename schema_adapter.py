@@ -34,7 +34,6 @@ NEW_TO_OLD_SCHEMA_MAP = {
     "interior_cond_picklist_id_name": "interiorcondition",
     "tire_cond_picklist_id_name": "tirecondition",
     "color": "nav_color",
-    "zip" : "vazipcode",
 
     # --- Engine & drivetrain ---
     "engines_name": "engine_name",             # regex-parsed for HP/displacement/etc. downstream
@@ -53,6 +52,7 @@ NEW_TO_OLD_SCHEMA_MAP = {
     "state_title_picklist_name": "state_province_of_title",
     "us_styles": "us_style_name",
     "state_picklist_id_name": "vstate_name",
+    "zip": "vazipcode",                     # new schema's plain address zip -> legacy geo feature column
     "vin_hin_no": "vin",                    # currently inert: preprocessor.py drops the VIN outright
                                                 # and no is_valid_vin logic exists anywhere in the codebase
     "comment": "all_clean_notes",              # currently inert: not read anywhere in preprocessor.py
