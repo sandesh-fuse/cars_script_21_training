@@ -64,13 +64,14 @@ STANDARD_CONFIG = {
     'use_macro': True, 'use_geo': True, 'use_cult': False,
 }
 
-# Features requested for exclusion from script21's training set. Resolved via
-# schema_adapter.NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the
-# preprocessor actually sees (raw incoming DB field name -> legacy name in the
-# comments below). script21-only: preprocessor.py's shared class defaults
-# (used by script17 too) are untouched; this list is passed in per-instance
-# via SaleValuePreprocessor(extra_drop_cols=...).
-SCRIPT21_EXCLUDED_FEATURES = [
+# DataOne-sourced vehicle spec features. Resolved via schema_adapter's
+# NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the preprocessor actually
+# sees (raw incoming DB field name -> legacy name in the comments below).
+# Gated by the --use-dataone CLI flag (see main()): when OFF (default) these
+# are excluded via SaleValuePreprocessor(extra_drop_cols=...); when ON they
+# flow through untouched. script21-only: preprocessor.py's shared class
+# defaults (used by script17 too) are unaffected either way.
+DATAONE_FEATURES = [
     'oem_body_style',       # raw 'body_type'          -> legacy 'oem_body_style'
     'drive_type',           # raw 'drive_type'         -> legacy 'drive_type' (no rename)
     'engine_name',          # raw 'engines_name'       -> legacy 'engine_name'
@@ -210,7 +211,7 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         use_macro=config['use_macro'], use_geo=config['use_geo'], use_cult=config['use_cult'],
         with_target_encoding=False,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
-        extra_drop_cols=SCRIPT21_EXCLUDED_FEATURES,
+        extra_drop_cols=[] if args.use_dataone else DATAONE_FEATURES,
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -287,6 +288,10 @@ def main():
                         help="Drop rows where salevalue <= this dollar amount (default 0, "
                              "which keeps current behavior: salevalue > 0). "
                              "Examples: 50 (drop rows below $50), 100 (drop scrap-priced cars).")
+    parser.add_argument("--use-dataone", action='store_true',
+                        help="Include DataOne-sourced vehicle spec features "
+                             f"({', '.join(DATAONE_FEATURES)}) in training. "
+                             "Default: false (these features are excluded).")
     parser.add_argument("--save-shap", action='store_true',
                         help="Compute and save per-row SHAP attributions for every train + "
                              "test row against the p50 model. Writes 4 large files: "
@@ -328,6 +333,13 @@ def main():
     else:
         XGB_KWARGS_GLOBAL = {'tree_method': 'hist'}
         print(">>> CPU mode (XGB kwargs: tree_method='hist')")
+
+    if args.use_dataone:
+        print(">>> DataOne features ENABLED (--use-dataone): "
+              f"{DATAONE_FEATURES} will be used for training")
+    else:
+        print(">>> DataOne features DISABLED (default): "
+              f"{DATAONE_FEATURES} will be excluded from training")
 
     os.makedirs(args.out, exist_ok=True)
     start_t = time.time()
@@ -760,6 +772,8 @@ def main():
             'standard_xgb_params_by_q': params_std,
             'retune_used': bool(args.retune),
             'gpu_used': bool(args.gpu),
+            'use_dataone': bool(args.use_dataone),
+            'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
             'cap_pct': args.cap_pct,
             'cap_value': cap_value,
             'min_salevalue': args.min_salevalue,

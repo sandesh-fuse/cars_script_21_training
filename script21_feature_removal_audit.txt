@@ -1,5 +1,12 @@
 SCRIPT21 FEATURE REMOVAL AUDIT
 Date: 2026-08-13
+Updated: 2026-08-14 -- Group 1 below is no longer a permanent removal. It's
+       now gated by the --use-dataone CLI flag on train_save_script21.py
+       (DATAONE_FEATURES list, was SCRIPT21_EXCLUDED_FEATURES):
+         python train_save_script21.py                  # default: excluded (unchanged)
+         python train_save_script21.py --use-dataone     # included
+       Recorded in training_metadata.json as 'use_dataone' /
+       'dataone_features_excluded' for every run.
 Scope: script21 ONLY (train_save_script21.py / artifacts/script21/).
        preprocessor.py's shared class defaults are untouched, so script17
        (train_save_script17.py / artifacts/script17/) is NOT affected and
@@ -19,10 +26,11 @@ columns get renamed to legacy names by map_raw_features_to_legacy() before
 preprocessor.py ever sees the data).
 
 --------------------------------------------------------------------------
-GROUP 1 — WAS ACTUALLY USED AS A FEATURE -> NOW REMOVED (script21 only)
+GROUP 1 — WAS ACTUALLY USED AS A FEATURE -> EXCLUDED BY DEFAULT (script21 only)
 --------------------------------------------------------------------------
-Enforced via a new SaleValuePreprocessor(extra_drop_cols=...) hook, passed
-in from train_save_script21.py's SCRIPT21_EXCLUDED_FEATURES list.
+Enforced via a SaleValuePreprocessor(extra_drop_cols=...) hook, fed from
+train_save_script21.py's DATAONE_FEATURES list, gated by --use-dataone
+(default off -> excluded; pass --use-dataone to include them).
 
   Requested name        Resolves to (legacy)    How it was used
   ---------------        ---------------------   ----------------------------
@@ -102,12 +110,16 @@ FILES CHANGED
                             script17 behavior identical).
                           - _basic_clean() now also drops self.extra_drop_cols
                             alongside USER_DROP_COLS / DROP_COLS_NO_ZIP.
-  train_save_script21.py - Added SCRIPT21_EXCLUDED_FEATURES list (the 10
-                            Group 1 legacy names).
-                          - train_subset_with_quantiles() now passes
-                            extra_drop_cols=SCRIPT21_EXCLUDED_FEATURES into
-                            SaleValuePreprocessor for both the CULT and
-                            STANDARD routes.
+  train_save_script21.py - Added DATAONE_FEATURES list (the 10 Group 1
+                            legacy names; renamed from the original
+                            SCRIPT21_EXCLUDED_FEATURES).
+                          - Added --use-dataone CLI flag (default off).
+                          - train_subset_with_quantiles() passes
+                            extra_drop_cols=[] if args.use_dataone else
+                            DATAONE_FEATURES into SaleValuePreprocessor, for
+                            both the CULT and STANDARD routes.
+                          - use_dataone / dataone_features_excluded recorded
+                            in training_metadata.json each run.
   schema_adapter.py       - NOT modified. Its rename map must stay intact
                             (e.g. vehicle_category -> body_type and the
                             ice_* renames are still needed for other
