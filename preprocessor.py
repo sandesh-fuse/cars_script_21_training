@@ -314,6 +314,10 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         'other_damages_normalized',
         # Other-damages interactions (string-concat → freq-encoded)
         'damage_x_mileage_bkt',
+        # New raw categoricals (mileage-trust/title/weight-class/body/engine)
+        'gvm_range', 'body_subtype', 'engine_type',
+        # Mileage-trust interaction (string-concat → freq-encoded)
+        'mileage_unknown_x_make',
     ]
     GEO_FREQ_COLS = [
         'zip_region_x_vehicle_type','zip_region_x_body_type','zip_region_x_nav_condition',
@@ -327,6 +331,60 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
     ]
     MILEAGE_EDGES = [-np.inf, 60_000, 110_000, 155_000, 200_000, 245_000, np.inf]
     AGE_EDGES     = [-1, 5, 10, 15, 20, 60]
+
+    # Raw fields that arrive as inconsistently-encoded booleans (Python bool,
+    # 'True'/'False'/'t'/'f'/'yes'/'no' strings, 0/1, or blank) and need
+    # coercing to a clean 0/1 flag before they're useful as model features.
+    # Without this, e.g. 't' and 'true' would int-encode as two DIFFERENT
+    # categories instead of collapsing to the same flag. Blank/unrecognized
+    # values become NaN (not 0) so the model can tell "confirmed false" apart
+    # from "unknown" — see _coerce_bool_flag.
+    BOOL_FLAG_COLS = [
+        'true_mileage_unknown', 'clean_title',
+        'locatedatdonationca', 'accessiblefortwotruck',
+    ]
+    _BOOL_TRUE_TOKENS  = {'true', 't', 'yes', 'y', '1'}
+    _BOOL_FALSE_TOKENS = {'false', 'f', 'no', 'n', '0'}
+
+    # Vocabulary folding for drive_type: collapse variant surface forms into
+    # a canonical vocabulary before frequency encoding (mainly relevant when
+    # --use-dataone is on, since drive_type is excluded by default). Keys are
+    # matched post-_normalize_text (already lowercased/stripped). Anything
+    # not listed here passes through unchanged.
+    DRIVE_TYPE_FOLD_MAP = {
+        'fwd': 'fwd', 'front-wheel drive': 'fwd', 'front wheel drive': 'fwd',
+        'rwd': 'rwd', 'rear-wheel drive': 'rwd', 'rear wheel drive': 'rwd',
+        'awd': 'awd', 'all-wheel drive': 'awd', 'all wheel drive': 'awd',
+        '4x4': '4wd', '4wd': '4wd', '4-wheel drive': '4wd',
+        '4 wheel drive': '4wd', '2wd/4wd': '4wd',
+        '6x4': 'other_heavy', '6x6': 'other_heavy',
+        '8x4': 'other_heavy', '10x6': 'other_heavy',
+        'not applicable': np.nan,
+    }
+
+    @classmethod
+    def _coerce_bool_flag(cls, series):
+        """Map messy boolean-ish values to a clean 0/1 float.
+
+        Handles Python/numpy bool, numeric 0/1, and string variants
+        ('true'/'t'/'yes'/'y'/'1', 'false'/'f'/'no'/'n'/'0'), case-
+        insensitively. Missing or unrecognized values become NaN rather
+        than being silently treated as False.
+        """
+        def _one(v):
+            if pd.isna(v):
+                return np.nan
+            if isinstance(v, (bool, np.bool_)):
+                return float(v)
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                if v == 1: return 1.0
+                if v == 0: return 0.0
+                return np.nan
+            s = str(v).strip().lower()
+            if s in cls._BOOL_TRUE_TOKENS:  return 1.0
+            if s in cls._BOOL_FALSE_TOKENS: return 0.0
+            return np.nan
+        return series.map(_one)
 
     def __init__(self, time_col=TIME_COL, seed=42,
                  use_macro=False, use_geo=False, use_cult=False,
@@ -456,6 +514,8 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                                       "won't pass smog",
                                       'wont pass smog/state inspection',
                                       'wont pass smog']),
+        ('has_airbag_deployed',     ['air bag(s) deployed', 'air bag deployed',
+                                      'airbag(s) deployed', 'airbag deployed']),
     ]
 
     @staticmethod
@@ -625,7 +685,22 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # capitalized strings like '"Mold"' that the text-normalizer would mangle).
         X = self._parse_other_damages(X)
 
+        # Step 4.5: coerce messy boolean-ish raw fields to a clean 0/1 float
+        # BEFORE text normalization. Once coerced these are numeric, so
+        # _normalize_text's dtype-based column selection skips them below.
+        for col in self.BOOL_FLAG_COLS:
+            if col in X.columns:
+                X[col] = self._coerce_bool_flag(X[col])
+
         X = self._normalize_text(X)
+
+        # Fold drive_type variant spellings into a canonical vocabulary (post
+        # text-normalization, so keys are already lowercased/stripped).
+        if 'drive_type' in X.columns:
+            X['drive_type'] = X['drive_type'].map(
+                lambda v: self.DRIVE_TYPE_FOLD_MAP.get(v, v)
+            )
+
         if self.use_cult:
             X = self._add_cult_features(X)
         if 'mileage' in X.columns:
@@ -826,6 +901,39 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['damage_x_mileage_bkt'] = cc(
                 X['has_other_damage'].astype(str),
                 X['mileage_bucket'].astype(str),
+            )
+
+        # Mileage-trust flag interactions (true_mileage_unknown: 1 = odometer
+        # reading isn't trustworthy). Numeric x numeric/bucket use plain
+        # multiplication (matches cult_x_age/cult_x_mileage_bkt pattern); the
+        # make interaction is string-concat, freq-encoded downstream.
+        if {'true_mileage_unknown', 'age'}.issubset(X.columns):
+            X['mileage_unknown_x_age'] = (
+                X['true_mileage_unknown'].fillna(0) * X['age'].fillna(-1)
+            )
+        if {'true_mileage_unknown', 'mileage_bucket'}.issubset(X.columns):
+            X['mileage_unknown_x_mileage_bucket'] = (
+                X['true_mileage_unknown'].fillna(0) * X['mileage_bucket']
+            )
+        if {'true_mileage_unknown', 'make'}.issubset(X.columns):
+            X['mileage_unknown_x_make'] = cc(
+                X['true_mileage_unknown'].fillna(-1).astype(str), X['make']
+            )
+
+        # Clean-title interactions (clean_title: 1 = clean title, vs.
+        # branded/salvage/rebuilt).
+        if {'clean_title', 'age'}.issubset(X.columns):
+            X['clean_title_x_age'] = X['clean_title'].fillna(0) * X['age'].fillna(-1)
+        if {'clean_title', 'mileage_bucket'}.issubset(X.columns):
+            X['clean_title_x_mileage_bucket'] = (
+                X['clean_title'].fillna(0) * X['mileage_bucket']
+            )
+
+        # Tow-truck accessibility x running condition -- inaccessible AND
+        # non-running is a materially worse combo than either alone.
+        if {'accessiblefortwotruck', 'runs_flag'}.issubset(X.columns):
+            X['tow_access_x_runs_flag'] = (
+                X['accessiblefortwotruck'].fillna(0) * X['runs_flag']
             )
         return X
 
@@ -1083,6 +1191,7 @@ MONO_FEATURES = {
     'loan_at_sale': -1, 'manheim_at_sale': +1,
     'is_cult': +1, 'cult_tier_num': +1, 'cult_enthusiast_score': +1,
     'cult_uplift_mid': +1, 'cult_uplift_high': +1, 'cult_last_of_kind': +1,
+    'true_mileage_unknown': -1, 'clean_title': +1,
 }
 
 

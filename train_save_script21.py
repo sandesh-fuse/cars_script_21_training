@@ -375,6 +375,24 @@ def main():
         cap_dropped = pre_cap_n - len(df)
         print(f"Target-value cap: {args.cap_pct}th percentile = ${cap_value:,.0f}  "
               f"(dropped {cap_dropped:,} rows of {pre_cap_n:,})")
+
+    # Specialty items (RVs, boats, heavy equipment, etc.) behave completely
+    # differently price-wise than standard cars and shouldn't be mixed into
+    # this model's training data. Both training CSVs' filenames already
+    # assume specialty items are excluded upstream; this makes it an
+    # explicit, auditable guarantee in code rather than trusting the input
+    # file. Robust string-based coercion (not a bare `== True`) since the
+    # raw column may arrive as an actual bool, a 'True'/'False' string, or
+    # blank. Blank/NaN is treated as NOT specialty (kept) -- only rows
+    # explicitly flagged true are dropped.
+    if 'Specialty Item' in df.columns:
+        pre_specialty_n = len(df)
+        is_specialty = (df['Specialty Item'].astype(str).str.strip().str.lower()
+                          .isin(['true', '1', 'yes', 't']))
+        df = df[~is_specialty]
+        print(f"Specialty-item filter: dropped {pre_specialty_n - len(df):,} rows "
+              f"flagged as Specialty Item (of {pre_specialty_n:,})")
+
     print(f"After filter: {df.shape}")
 
     print(f"Loading cult cars from {args.cult}...")
