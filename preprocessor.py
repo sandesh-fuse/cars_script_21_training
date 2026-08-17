@@ -29,6 +29,27 @@ TIME_COL   = "record_creation_date"
 BASE_YEAR  = 2026
 BASE_MONTH = 4
 
+# DataOne-sourced vehicle spec features. Resolved via schema_adapter's
+# NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the preprocessor actually
+# sees (raw incoming DB field name -> legacy name in the comments below).
+# Single source of truth for two things: (1) train_save_script21.py's
+# --use-dataone flag uses this list to gate inclusion/exclusion via
+# SaleValuePreprocessor(extra_drop_cols=...); (2) SaleValuePreprocessor
+# itself uses it to compute `is_dataone_missing` (coverage signal, always
+# present regardless of the --use-dataone toggle -- see _basic_clean).
+DATAONE_FEATURES = [
+    'oem_body_style',       # raw 'body_type'          -> legacy 'oem_body_style'
+    'drive_type',           # raw 'drive_type'         -> legacy 'drive_type' (no rename)
+    'engine_name',          # raw 'engines_name'       -> legacy 'engine_name'
+    'engineconfiguration',  # raw 'ice_block_type'     -> legacy 'engineconfiguration'
+    'enginecylinders',      # raw 'ice_cylinders'      -> legacy 'enginecylinders'
+    'displacementl',        # raw 'ice_displacement'   -> legacy 'displacementl'
+    'enginehp',             # raw 'ice_max_hp'         -> legacy 'enginehp'
+    'msrp',                 # raw 'msrp'               -> legacy 'msrp' (no rename)
+    'transmission_name',    # raw 'transmissions_name' -> legacy 'transmission_name'
+    'us_style_name',        # raw 'us_styles'          -> legacy 'us_style_name'
+]
+
 # ============================================================
 # MACRO DATA
 # ============================================================
@@ -166,6 +187,47 @@ def build_zip_lookup(zip_series):
     out = nomi.query_postal_code(uniq)
     out = out[['postal_code','latitude','longitude']].set_index('postal_code')
     return out['latitude'].to_dict(), out['longitude'].to_dict()
+
+# ============================================================
+# VENDOR-REGION EFFECT LOOKUP
+# ============================================================
+# vendor_id is NEVER available at inference (it's assigned by post-intake
+# routing/logistics, after the point a prediction would be made). This
+# lookup makes vendor's historical price effect usable anyway by keying the
+# FINAL, served feature on zip code (always available) instead of vendor
+# identity. vendor_id is touched ONLY here, ONCE, on historical training
+# data -- never inside SaleValuePreprocessor.transform(), never at
+# inference, never in app/schemas.py's PredictRequest.
+#
+# Two-stage: (1) genuine vendor-level target encoding of salevalue (needs
+# vendor_id -- this is the only step that does), (2) average that effect
+# across whichever vendor(s) historically served each 3-digit zip prefix,
+# producing a plain {zip_prefix: effect} dict with no vendor identity left
+# in it. At inference, only the requester's zip is used to look this up.
+def build_vendor_zip_lookup(train_df, vendor_col='vendor_id',
+                              zip_col='vazipcode', smoothing=20):
+    if vendor_col not in train_df.columns or zip_col not in train_df.columns:
+        return {}, None
+
+    global_mean = float(train_df[TARGET_COL].mean())
+
+    # Stage 1: smoothed vendor-level target encoding (uses vendor_id + salevalue)
+    vendor_agg = train_df.groupby(vendor_col)[TARGET_COL].agg(['mean', 'count'])
+    vendor_smoothed = ((vendor_agg['count'] * vendor_agg['mean'] + smoothing * global_mean)
+                        / (vendor_agg['count'] + smoothing))
+
+    # Stage 2: back off from vendor identity to zip region (uses vendor_id + zip,
+    # never zip + salevalue directly -- the effect being averaged already came
+    # from Stage 1's vendor-level encoding, not a raw regional price average).
+    z = (train_df[zip_col].astype(str)
+                          .str.extract(r'(\d{1,5})')[0].str.zfill(5))
+    zip_region = z.str[:3]
+    vendor_effect_per_row = train_df[vendor_col].map(vendor_smoothed)
+    region_effect = (pd.DataFrame({'zip_region': zip_region, 'effect': vendor_effect_per_row})
+                        .dropna()
+                        .groupby('zip_region')['effect']
+                        .mean())
+    return region_effect.to_dict(), global_mean
 
 # ============================================================
 # SEVERITY MAPS
@@ -328,6 +390,13 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         'make','model','trim','model_number','us_style_name',
         'engine_name','transmission_name','state_province_of_title',
         'condition_combo','all_cond_combo','nav_cond_x_age_bkt',
+        # Tier 1: simple categoricals, clear independent price signal
+        'oem_body_style', 'gvm_range', 'body_subtype', 'engine_type',
+        # Tier 2: higher-cardinality interactions -- frequency encoding
+        # likely loses the most signal here, but per-fold sample counts
+        # thin out faster too; validate against test_metrics.json.
+        'mileage_unknown_x_make', 'enginecylinders_x_make',
+        'engineconfig_x_make', 'damage_x_mileage_bkt',
     ]
     MILEAGE_EDGES = [-np.inf, 60_000, 110_000, 155_000, 200_000, 245_000, np.inf]
     AGE_EDGES     = [-1, 5, 10, 15, 20, 60]
@@ -391,7 +460,8 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                  with_target_encoding=False, smoothing=20, n_folds=5,
                  zip_lat_map=None, zip_lon_map=None, cult_lookup=None,
                  n_clusters=12, cluster_min_samples=50,
-                 extra_drop_cols=None):
+                 extra_drop_cols=None,
+                 vendor_zip_lookup=None, vendor_global_mean=None):
         self.time_col = time_col
         self.seed     = seed
         self.use_macro = use_macro
@@ -403,6 +473,12 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         self.zip_lat_map = zip_lat_map or {}
         self.zip_lon_map = zip_lon_map or {}
         self.cult_lookup = cult_lookup or {}
+        # Fitted {zip_prefix: historical vendor effect} dict from
+        # build_vendor_zip_lookup(). vendor_id itself is never stored here or
+        # anywhere downstream -- only this already-aggregated, zip-keyed
+        # lookup, which is all _add_vendor_features() ever touches.
+        self.vendor_zip_lookup = vendor_zip_lookup or {}
+        self.vendor_global_mean = vendor_global_mean
         # Caller-supplied extra columns to hard-drop, on top of USER_DROP_COLS /
         # DROP_COLS_NO_ZIP. Lets one pipeline (e.g. script21) exclude features
         # without changing the shared class defaults other callers (script17)
@@ -649,6 +725,22 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         X['cult_uplift_range'] = (X['cult_uplift_high'] - X['cult_uplift_low'])
         return X
 
+    def _add_vendor_features(self, X):
+        """Apply the fitted vendor-region lookup using ONLY zip code.
+
+        vendor_id is never read here or anywhere in this class -- only the
+        already-aggregated {zip_prefix: effect} dict built once by
+        build_vendor_zip_lookup() during training. Safe to call at inference
+        with just the request's vazipcode.
+        """
+        if not self.vendor_zip_lookup or 'vazipcode' not in X.columns:
+            return X
+        z = X['vazipcode'].astype(str).str.extract(r'(\d{1,5})')[0].str.zfill(5)
+        zip_region = z.str[:3]
+        default = self.vendor_global_mean if self.vendor_global_mean is not None else 0.0
+        X['vendor_region_effect'] = zip_region.map(self.vendor_zip_lookup).fillna(default)
+        return X
+
     def _basic_clean(self, X):
         # Step 1: coalesce paired (nav_*, primary) columns. Prefer nav_*, fall
         # back to the primary field. The unified value lives in the primary
@@ -664,6 +756,17 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             elif nav_col in X.columns:
                 # Only the nav variant exists — rename to the primary
                 X = X.rename(columns={nav_col: primary_col})
+
+        # Step 1.5: capture DataOne coverage BEFORE Step 2's extra_drop_cols
+        # potentially removes these columns entirely (e.g. --use-dataone
+        # off). Independent of whether the DataOne fields themselves end up
+        # used as features -- this just records whether DataOne enrichment
+        # happened at all for this row, and always persists as a feature.
+        dataone_cols_present = [c for c in DATAONE_FEATURES if c in X.columns]
+        if dataone_cols_present:
+            X['is_dataone_missing'] = X[dataone_cols_present].isna().all(axis=1).astype(int)
+        else:
+            X['is_dataone_missing'] = 1
 
         # Step 2: drop the user-specified columns + the legacy drop list.
         # USER_DROP_COLS includes engineered features (dsrating_num,
@@ -700,6 +803,21 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['drive_type'] = X['drive_type'].map(
                 lambda v: self.DRIVE_TYPE_FOLD_MAP.get(v, v)
             )
+
+        # Registration-vs-title state mismatch. The two agree ~98% of the
+        # time (checked against real data), so the raw registration-state
+        # column is mostly a duplicate of state_province_of_title -- only
+        # the mismatch itself carries incremental signal, so we compute the
+        # flag and then drop the raw column rather than let it become its
+        # own (mostly-redundant) freq-encoded feature.
+        if {'state_province_of_registration', 'state_province_of_title'}.issubset(X.columns):
+            X['registration_title_state_mismatch'] = (
+                X['state_province_of_registration'].fillna('__na__')
+                != X['state_province_of_title'].fillna('__na__')
+            ).astype(int)
+            X = X.drop(columns=['state_province_of_registration'])
+
+        X = self._add_vendor_features(X)
 
         if self.use_cult:
             X = self._add_cult_features(X)
@@ -934,6 +1052,38 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         if {'accessiblefortwotruck', 'runs_flag'}.issubset(X.columns):
             X['tow_access_x_runs_flag'] = (
                 X['accessiblefortwotruck'].fillna(0) * X['runs_flag']
+            )
+
+        # Compound trust signal: mileage untrustworthy AND title not clean is
+        # a materially stronger red flag than either alone. clean_title is
+        # inverted (1 - clean_title) so the product is 1 only when BOTH are
+        # bad; missing clean_title defaults to "assume clean" (neutral).
+        if {'true_mileage_unknown', 'clean_title'}.issubset(X.columns):
+            X['mileage_unknown_x_clean_title'] = (
+                X['true_mileage_unknown'].fillna(0) * (1 - X['clean_title'].fillna(1))
+            )
+
+        # Vendor-region effect interactions (see _add_vendor_features/
+        # build_vendor_zip_lookup -- zip-keyed proxy, never uses vendor_id
+        # at inference).
+        if {'vendor_region_effect', 'age'}.issubset(X.columns):
+            X['vendor_region_effect_x_age'] = (
+                X['vendor_region_effect'].fillna(0) * X['age'].fillna(-1)
+            )
+        if {'vendor_region_effect', 'mileage_bucket'}.issubset(X.columns):
+            X['vendor_region_effect_x_mileage_bucket'] = (
+                X['vendor_region_effect'].fillna(0) * X['mileage_bucket']
+            )
+
+        # Registration/title state mismatch interactions (see mismatch flag
+        # computed in _basic_clean).
+        if {'registration_title_state_mismatch', 'age'}.issubset(X.columns):
+            X['registration_mismatch_x_age'] = (
+                X['registration_title_state_mismatch'].fillna(0) * X['age'].fillna(-1)
+            )
+        if {'registration_title_state_mismatch', 'mileage_bucket'}.issubset(X.columns):
+            X['registration_mismatch_x_mileage_bucket'] = (
+                X['registration_title_state_mismatch'].fillna(0) * X['mileage_bucket']
             )
         return X
 
@@ -1192,6 +1342,8 @@ MONO_FEATURES = {
     'is_cult': +1, 'cult_tier_num': +1, 'cult_enthusiast_score': +1,
     'cult_uplift_mid': +1, 'cult_uplift_high': +1, 'cult_last_of_kind': +1,
     'true_mileage_unknown': -1, 'clean_title': +1,
+    'vendor_region_effect': +1, 'registration_title_state_mismatch': -1,
+    'is_dataone_missing': -1,
 }
 
 

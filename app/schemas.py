@@ -66,6 +66,7 @@ class PredictRequest(BaseModel):
     vazipcode: Optional[str] = None
     vstate_name: Optional[str] = None
     state_province_of_title: Optional[str] = None
+    state_province_of_registration: Optional[str] = None
     accessiblefortwotruck: Optional[bool] = None
     locatedatdonationca: Optional[bool] = None
 

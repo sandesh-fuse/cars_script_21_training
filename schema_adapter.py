@@ -50,6 +50,7 @@ NEW_TO_OLD_SCHEMA_MAP = {
     "located_at_donation_c_a": "locatedatdonationca",
     "speciality_item": "Specialty Item",
     "state_title_picklist_name": "state_province_of_title",
+    "state_registration_picklist_name": "state_province_of_registration",
     "us_styles": "us_style_name",
     "state_picklist_id_name": "vstate_name",
     "zip": "vazipcode",                     # new schema's plain address zip -> legacy geo feature column

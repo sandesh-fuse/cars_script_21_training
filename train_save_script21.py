@@ -33,9 +33,10 @@ import pandas as pd
 from xgboost import XGBRegressor
 
 from preprocessor import (
-    SaleValuePreprocessor, MONO_FEATURES,
+    SaleValuePreprocessor, MONO_FEATURES, DATAONE_FEATURES,
     TARGET_COL, TIME_COL,
     build_cult_lookup, build_zip_lookup, compute_cult_flag,
+    build_vendor_zip_lookup,
     cpi_ratio_arr, adjust_target, deflate_pred,
 )
 from schema_adapter import map_raw_features_to_legacy, filter_to_known_columns
@@ -64,25 +65,12 @@ STANDARD_CONFIG = {
     'use_macro': True, 'use_geo': True, 'use_cult': False,
 }
 
-# DataOne-sourced vehicle spec features. Resolved via schema_adapter's
-# NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the preprocessor actually
-# sees (raw incoming DB field name -> legacy name in the comments below).
+# DATAONE_FEATURES is now defined in preprocessor.py (single source of
+# truth shared with is_dataone_missing's coverage check) and imported above.
 # Gated by the --use-dataone CLI flag (see main()): when OFF (default) these
 # are excluded via SaleValuePreprocessor(extra_drop_cols=...); when ON they
 # flow through untouched. script21-only: preprocessor.py's shared class
 # defaults (used by script17 too) are unaffected either way.
-DATAONE_FEATURES = [
-    'oem_body_style',       # raw 'body_type'          -> legacy 'oem_body_style'
-    'drive_type',           # raw 'drive_type'         -> legacy 'drive_type' (no rename)
-    'engine_name',          # raw 'engines_name'       -> legacy 'engine_name'
-    'engineconfiguration',  # raw 'ice_block_type'     -> legacy 'engineconfiguration'
-    'enginecylinders',      # raw 'ice_cylinders'      -> legacy 'enginecylinders'
-    'displacementl',        # raw 'ice_displacement'   -> legacy 'displacementl'
-    'enginehp',             # raw 'ice_max_hp'         -> legacy 'enginehp'
-    'msrp',                 # raw 'msrp'               -> legacy 'msrp' (no rename)
-    'transmission_name',    # raw 'transmissions_name' -> legacy 'transmission_name'
-    'us_style_name',        # raw 'us_styles'          -> legacy 'us_style_name'
-]
 
 DEFAULT_PARAMS_CULT = {
     "q05": dict(learning_rate=0.03, max_depth=8, min_child_weight=20,
@@ -204,24 +192,32 @@ def tune_quantile(name, X_tr, y_tr_adj, X_va, y_va_adj, monotone, quantile_alpha
 # TRAIN A SUBSET MODEL (CULT or STANDARD) WITH 3 QUANTILES
 # ============================================================
 def train_subset_with_quantiles(name, config, default_params, train_subset, test_subset,
-                                  zip_lat_map, zip_lon_map, cult_lookup, args):
+                                  zip_lat_map, zip_lon_map, cult_lookup, args,
+                                  vendor_zip_lookup=None, vendor_global_mean=None):
     print(f"\n[{name}] Preprocessing (train_n={len(train_subset):,}, test_n={len(test_subset):,})...")
     pre = SaleValuePreprocessor(
         time_col=TIME_COL, seed=SEED,
         use_macro=config['use_macro'], use_geo=config['use_geo'], use_cult=config['use_cult'],
-        with_target_encoding=False,
+        with_target_encoding=True,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
         extra_drop_cols=[] if args.use_dataone else DATAONE_FEATURES,
+        vendor_zip_lookup=vendor_zip_lookup, vendor_global_mean=vendor_global_mean,
     )
 
     R_train = cpi_ratio_arr(train_subset)
     y_train = train_subset[TARGET_COL].values
+    # Computed before fit_transform_with_oof (rather than after, as before)
+    # so target encoding is fit on the same CPI-adjusted scale the quantile
+    # models actually train against.
+    y_train_adj = adjust_target(y_train, R_train, config['alpha'])
 
-    X_train = pre.fit(train_subset).transform(train_subset)
+    # OOF target encoding (matches train_save_script17.py's TE-base pattern):
+    # each row's TARGET_ENC_COLS_ALL columns are encoded using only the OTHER
+    # folds' data, so no row's own price leaks into its own feature value.
+    X_train = pre.fit_transform_with_oof(train_subset, y_train_adj)
     X_test  = pre.transform(test_subset.drop(columns=[TARGET_COL], errors='ignore'))
 
     monotone = tuple(MONO_FEATURES.get(c, 0) for c in pre.feature_cols_)
-    y_train_adj = adjust_target(y_train, R_train, config['alpha'])
 
     n_es = int(len(X_train) * 0.9)
     X_es_tr, X_es_va = X_train.iloc[:n_es], X_train.iloc[n_es:]
@@ -347,11 +343,22 @@ def main():
     print(f"\nLoading training data from {args.data}...")
     df = pd.read_csv(args.data, low_memory=False)
 
+    # Capture vendor_id BEFORE schema filtering drops it (it's not a
+    # recognized column -- never a PredictRequest field, never in
+    # schema_adapter's map -- by design, since it must never be expected at
+    # inference). Used ONLY to fit a training-time-only, zip-keyed vendor
+    # effect lookup below; re-attached to df temporarily so it survives the
+    # same row filters as everything else, then dropped again before any
+    # SaleValuePreprocessor ever sees it.
+    _vendor_id_raw = df['vendor_id'].copy() if 'vendor_id' in df.columns else None
+
     print("Dropping columns not recognized by the schema adapter (DB noise/metadata)...")
     df = filter_to_known_columns(df)
 
     print("Mapping new database schema to legacy ML schema...")
     df = map_raw_features_to_legacy(df)
+    if _vendor_id_raw is not None:
+        df['_vendor_id_for_lookup'] = _vendor_id_raw.reindex(df.index)
 
     #df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors='coerce')
     df[TIME_COL] = pd.to_datetime(df[TIME_COL], format='mixed', errors='coerce')
@@ -408,6 +415,21 @@ def main():
     test_raw  = df[df[TIME_COL] >= test_cutoff].copy().reset_index(drop=True)
     print(f"Train: {len(train_raw):,}  Test: {len(test_raw):,}")
 
+    # Build the vendor-region effect lookup from TRAIN ONLY (never test).
+    # vendor_id is used HERE AND ONLY HERE; the column is dropped immediately
+    # after so it can never reach SaleValuePreprocessor.fit()/.transform() or
+    # become a model feature, and never appears in a PredictRequest.
+    if '_vendor_id_for_lookup' in train_raw.columns:
+        print("Building vendor-region effect lookup (train-only; vendor_id discarded right after)...")
+        VENDOR_ZIP_LOOKUP, VENDOR_GLOBAL_MEAN = build_vendor_zip_lookup(
+            train_raw.rename(columns={'_vendor_id_for_lookup': 'vendor_id'}))
+        print(f"  {len(VENDOR_ZIP_LOOKUP):,} zip-region vendor-effect entries built.")
+        train_raw = train_raw.drop(columns=['_vendor_id_for_lookup'])
+        test_raw  = test_raw.drop(columns=['_vendor_id_for_lookup'], errors='ignore')
+    else:
+        VENDOR_ZIP_LOOKUP, VENDOR_GLOBAL_MEAN = {}, None
+        print("Vendor-region effect lookup: skipped (vendor_id not present in source data).")
+
     # Partition
     train_cult_flag = compute_cult_flag(train_raw, CULT_LOOKUP)
     test_cult_flag  = compute_cult_flag(test_raw,  CULT_LOOKUP)
@@ -423,14 +445,16 @@ def main():
     pre_cult, models_cult, preds_cult, params_cult = train_subset_with_quantiles(
         "CULT", CULT_CONFIG, DEFAULT_PARAMS_CULT,
         train_cult_raw, test_cult_raw,
-        LAT_MAP, LON_MAP, CULT_LOOKUP, args)
+        LAT_MAP, LON_MAP, CULT_LOOKUP, args,
+        vendor_zip_lookup=VENDOR_ZIP_LOOKUP, vendor_global_mean=VENDOR_GLOBAL_MEAN)
 
     # Train standard quantiles
     print("\n" + "#" * 70 + "\n# STANDARD MODEL (3 quantiles)\n" + "#" * 70)
     pre_std, models_std, preds_std, params_std = train_subset_with_quantiles(
         "STANDARD", STANDARD_CONFIG, DEFAULT_PARAMS_STANDARD,
         train_std_raw, test_std_raw,
-        LAT_MAP, LON_MAP, CULT_LOOKUP, args)
+        LAT_MAP, LON_MAP, CULT_LOOKUP, args,
+        vendor_zip_lookup=VENDOR_ZIP_LOOKUP, vendor_global_mean=VENDOR_GLOBAL_MEAN)
 
     # Routed predictions
     y_test = test_raw[TARGET_COL].values
@@ -508,6 +532,10 @@ def main():
     joblib.dump(CULT_LOOKUP, os.path.join(args.out, "cult_lookup.joblib"))
     joblib.dump(LAT_MAP, os.path.join(args.out, "zip_lat_map.joblib"))
     joblib.dump(LON_MAP, os.path.join(args.out, "zip_lon_map.joblib"))
+    # {zip_prefix: effect} only -- no vendor_id anywhere in this artifact.
+    # Also embedded in preprocessor_{cult,standard}.joblib already; saved
+    # standalone too for inspection, matching the cult_lookup/zip_map convention.
+    joblib.dump(VENDOR_ZIP_LOOKUP, os.path.join(args.out, "vendor_zip_lookup.joblib"))
     with open(os.path.join(args.out, "alphas.json"), 'w') as f:
         json.dump({
             'cult_alpha': CULT_CONFIG['alpha'],
@@ -792,6 +820,8 @@ def main():
             'gpu_used': bool(args.gpu),
             'use_dataone': bool(args.use_dataone),
             'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
+            'vendor_zip_lookup_size': len(VENDOR_ZIP_LOOKUP),
+            'vendor_global_mean': VENDOR_GLOBAL_MEAN,
             'cap_pct': args.cap_pct,
             'cap_value': cap_value,
             'min_salevalue': args.min_salevalue,
