@@ -135,4 +135,5 @@ wheels/
 
 .env
 artifacts/script21/
+artifacts/
 *.csv

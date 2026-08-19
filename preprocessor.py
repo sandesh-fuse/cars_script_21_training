@@ -29,6 +29,15 @@ TIME_COL   = "record_creation_date"
 BASE_YEAR  = 2026
 BASE_MONTH = 4
 
+# Raw feature set extracted from commit 20c8c17 ("added new features
+# true_mileage_unknown, clean_title (bool), gvm_range, tonnage, engine_type").
+# Single source of truth so train_save_script21.py's --enable-new-features
+# flag can gate inclusion via SaleValuePreprocessor(extra_drop_cols=...) —
+# same mechanism, same intent as script21's existing --use-dataone/
+# DATAONE_FEATURES pattern, just for a different feature set. Default
+# behavior (none enabled) is byte-identical to the 2406a7a checkpoint.
+NEW_FEATURE_COLS = ['true_mileage_unknown', 'clean_title', 'gvm_range', 'tonnage', 'engine_type']
+
 # ============================================================
 # MACRO DATA
 # ============================================================
@@ -314,6 +323,10 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         'other_damages_normalized',
         # Other-damages interactions (string-concat → freq-encoded)
         'damage_x_mileage_bkt',
+        # New raw categoricals (mileage-trust/title/weight-class/body/engine)
+        'gvm_range', 'body_subtype', 'engine_type',
+        # Mileage-trust interaction (string-concat → freq-encoded)
+        'mileage_unknown_x_make',
     ]
     GEO_FREQ_COLS = [
         'zip_region_x_vehicle_type','zip_region_x_body_type','zip_region_x_nav_condition',
@@ -328,11 +341,47 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
     MILEAGE_EDGES = [-np.inf, 60_000, 110_000, 155_000, 200_000, 245_000, np.inf]
     AGE_EDGES     = [-1, 5, 10, 15, 20, 60]
 
+    # Raw fields that arrive as inconsistently-encoded booleans (Python bool,
+    # 'True'/'False'/'t'/'f'/'yes'/'no' strings, 0/1, or blank) and need
+    # coercing to a clean 0/1 flag before they're useful as model features.
+    # Without this, e.g. 't' and 'true' would int-encode as two DIFFERENT
+    # categories instead of collapsing to the same flag. Blank/unrecognized
+    # values become NaN (not 0) so the model can tell "confirmed false" apart
+    # from "unknown" — see _coerce_bool_flag.
+    BOOL_FLAG_COLS = ['true_mileage_unknown', 'clean_title']
+    _BOOL_TRUE_TOKENS  = {'true', 't', 'yes', 'y', '1'}
+    _BOOL_FALSE_TOKENS = {'false', 'f', 'no', 'n', '0'}
+
+    @classmethod
+    def _coerce_bool_flag(cls, series):
+        """Map messy boolean-ish values to a clean 0/1 float.
+
+        Handles Python/numpy bool, numeric 0/1, and string variants
+        ('true'/'t'/'yes'/'y'/'1', 'false'/'f'/'no'/'n'/'0'), case-
+        insensitively. Missing or unrecognized values become NaN rather
+        than being silently treated as False.
+        """
+        def _one(v):
+            if pd.isna(v):
+                return np.nan
+            if isinstance(v, (bool, np.bool_)):
+                return float(v)
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                if v == 1: return 1.0
+                if v == 0: return 0.0
+                return np.nan
+            s = str(v).strip().lower()
+            if s in cls._BOOL_TRUE_TOKENS:  return 1.0
+            if s in cls._BOOL_FALSE_TOKENS: return 0.0
+            return np.nan
+        return series.map(_one)
+
     def __init__(self, time_col=TIME_COL, seed=42,
                  use_macro=False, use_geo=False, use_cult=False,
                  with_target_encoding=False, smoothing=20, n_folds=5,
                  zip_lat_map=None, zip_lon_map=None, cult_lookup=None,
-                 n_clusters=12, cluster_min_samples=50):
+                 n_clusters=12, cluster_min_samples=50,
+                 extra_drop_cols=None):
         self.time_col = time_col
         self.seed     = seed
         self.use_macro = use_macro
@@ -344,6 +393,11 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         self.zip_lat_map = zip_lat_map or {}
         self.zip_lon_map = zip_lon_map or {}
         self.cult_lookup = cult_lookup or {}
+        # Caller-supplied extra columns to hard-drop, on top of USER_DROP_COLS /
+        # DROP_COLS_NO_ZIP. Lets one pipeline (e.g. script21) toggle a feature
+        # subset on/off without changing the shared class defaults other
+        # callers (script17) rely on. See NEW_FEATURE_COLS / --enable-new-features.
+        self.extra_drop_cols = extra_drop_cols or []
         self.TARGET_ENC_COLS = self.TARGET_ENC_COLS_ALL if with_target_encoding else []
         # Vehicle-profile clustering: K-means on (make, model) attribute vectors.
         # NOTE: clusters are NOT fit on salevalue — zero target leakage. They group
@@ -604,7 +658,7 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # has_dsrating) that no longer make sense without the source column.
         all_drops = list(self.USER_DROP_COLS) + list(
             self.DROP_COLS_NO_ZIP if self.use_geo else self.DROP_COLS_WITH_ZIP_DROP
-        )
+        ) + list(self.extra_drop_cols)
         X = X.drop(columns=[c for c in all_drops if c in X.columns])
 
         # Step 3: parse structured features from engine_name BEFORE text
@@ -616,6 +670,13 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # Step 4: parse other_damages (also case-sensitive — JSON values contain
         # capitalized strings like '"Mold"' that the text-normalizer would mangle).
         X = self._parse_other_damages(X)
+
+        # Step 4.5: coerce messy boolean-ish raw fields to a clean 0/1 float
+        # BEFORE text normalization. Once coerced these are numeric, so
+        # _normalize_text's dtype-based column selection skips them below.
+        for col in self.BOOL_FLAG_COLS:
+            if col in X.columns:
+                X[col] = self._coerce_bool_flag(X[col])
 
         X = self._normalize_text(X)
         if self.use_cult:
@@ -818,6 +879,32 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['damage_x_mileage_bkt'] = cc(
                 X['has_other_damage'].astype(str),
                 X['mileage_bucket'].astype(str),
+            )
+
+        # Mileage-trust flag interactions (true_mileage_unknown: 1 = odometer
+        # reading isn't trustworthy). Numeric x numeric/bucket use plain
+        # multiplication (matches cult_x_age/cult_x_mileage_bkt pattern); the
+        # make interaction is string-concat, freq-encoded downstream.
+        if {'true_mileage_unknown', 'age'}.issubset(X.columns):
+            X['mileage_unknown_x_age'] = (
+                X['true_mileage_unknown'].fillna(0) * X['age'].fillna(-1)
+            )
+        if {'true_mileage_unknown', 'mileage_bucket'}.issubset(X.columns):
+            X['mileage_unknown_x_mileage_bucket'] = (
+                X['true_mileage_unknown'].fillna(0) * X['mileage_bucket']
+            )
+        if {'true_mileage_unknown', 'make'}.issubset(X.columns):
+            X['mileage_unknown_x_make'] = cc(
+                X['true_mileage_unknown'].fillna(-1).astype(str), X['make']
+            )
+
+        # Clean-title interactions (clean_title: 1 = clean title, vs.
+        # branded/salvage/rebuilt).
+        if {'clean_title', 'age'}.issubset(X.columns):
+            X['clean_title_x_age'] = X['clean_title'].fillna(0) * X['age'].fillna(-1)
+        if {'clean_title', 'mileage_bucket'}.issubset(X.columns):
+            X['clean_title_x_mileage_bucket'] = (
+                X['clean_title'].fillna(0) * X['mileage_bucket']
             )
         return X
 
@@ -1075,6 +1162,7 @@ MONO_FEATURES = {
     'loan_at_sale': -1, 'manheim_at_sale': +1,
     'is_cult': +1, 'cult_tier_num': +1, 'cult_enthusiast_score': +1,
     'cult_uplift_mid': +1, 'cult_uplift_high': +1, 'cult_last_of_kind': +1,
+    'true_mileage_unknown': -1, 'clean_title': +1,
 }
 
 

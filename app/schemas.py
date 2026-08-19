@@ -36,9 +36,14 @@ class PredictRequest(BaseModel):
     model_number: Optional[str] = None
     msrp: Optional[float] = None
     mileage: Optional[float] = None
+    true_mileage_unknown: Optional[bool] = None
+    clean_title: Optional[bool] = None
+    gvm_range: Optional[str] = None
+    tonnage: Optional[float] = None
 
     # Engine & Transmission attrs
     engine_name: Optional[str] = None
+    engine_type: Optional[str] = None
     engineconfiguration: Optional[str] = None
     enginecylinders: Optional[float] = None
     enginehp: Optional[float] = None

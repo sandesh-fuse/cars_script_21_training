@@ -33,7 +33,7 @@ import pandas as pd
 from xgboost import XGBRegressor
 
 from preprocessor import (
-    SaleValuePreprocessor, MONO_FEATURES,
+    SaleValuePreprocessor, MONO_FEATURES, NEW_FEATURE_COLS,
     TARGET_COL, TIME_COL,
     build_cult_lookup, build_zip_lookup, compute_cult_flag,
     cpi_ratio_arr, adjust_target, deflate_pred,
@@ -185,11 +185,14 @@ def tune_quantile(name, X_tr, y_tr_adj, X_va, y_va_adj, monotone, quantile_alpha
 def train_subset_with_quantiles(name, config, default_params, train_subset, test_subset,
                                   zip_lat_map, zip_lon_map, cult_lookup, args):
     print(f"\n[{name}] Preprocessing (train_n={len(train_subset):,}, test_n={len(test_subset):,})...")
+    enabled_new_features = [c.strip() for c in args.enable_new_features.split(",") if c.strip()]
+    new_features_drop_cols = [c for c in NEW_FEATURE_COLS if c not in enabled_new_features]
     pre = SaleValuePreprocessor(
         time_col=TIME_COL, seed=SEED,
         use_macro=config['use_macro'], use_geo=config['use_geo'], use_cult=config['use_cult'],
         with_target_encoding=False,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
+        extra_drop_cols=new_features_drop_cols,
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -292,12 +295,26 @@ def main():
                              "Use 0 to disable sampling (compute on all rows; slow for >100k). "
                              "Ignored when computing per-row SHAP (--save-shap), which always "
                              "uses every row.")
+    parser.add_argument("--enable-new-features", default="",
+                        help="Comma-separated subset of "
+                             f"{{{','.join(NEW_FEATURE_COLS)}}} to include as model "
+                             "features (from commit 20c8c17). Default: none (exact "
+                             "2406a7a checkpoint behavior — these columns are dropped). "
+                             "Example: --enable-new-features true_mileage_unknown,clean_title")
     args = parser.parse_args()
 
     if not (0 < args.cap_pct <= 100):
         parser.error("--cap-pct must be in (0, 100]")
     if args.min_salevalue < 0:
         parser.error("--min-salevalue must be >= 0")
+
+    enabled_new_features = [c.strip() for c in args.enable_new_features.split(",") if c.strip()]
+    unknown = set(enabled_new_features) - set(NEW_FEATURE_COLS)
+    if unknown:
+        parser.error(f"--enable-new-features: unrecognized column(s) {sorted(unknown)}; "
+                     f"choose from {NEW_FEATURE_COLS}")
+    new_features_drop_cols = [c for c in NEW_FEATURE_COLS if c not in enabled_new_features]
+    print(f">>> New features enabled: {enabled_new_features or '(none — 2406a7a baseline)'}")
 
     global XGB_KWARGS_GLOBAL
     if args.gpu:
@@ -735,6 +752,8 @@ def main():
             'cap_pct': args.cap_pct,
             'cap_value': cap_value,
             'min_salevalue': args.min_salevalue,
+            'enabled_new_features': enabled_new_features,
+            'new_features_excluded': new_features_drop_cols,
             'save_shap_used': bool(args.save_shap),
             'save_shap_global_used': bool(args.save_shap or args.save_shap_global),
             'n_optuna_trials_per_quantile': args.n_trials if args.retune else 0,
