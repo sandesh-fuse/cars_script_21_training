@@ -10,10 +10,23 @@ stay exactly as the checkpoint (reg:quantileerror), since they drive the
 are unchanged. See Baseline1.txt for the checkpoint's $516.73 test MAE to
 compare against.
 
+NOTE on --gpu + q50: on at least one observed CUDA build, reg:pseudohubererror
+on device='cuda' diverged within the first boosting round (log1p-space
+predictions blew up into the hundreds -> np.expm1 overflow -> inf pinball ->
+best_iteration=0), while reg:quantileerror trained normally on the same
+GPU/data. Rather than blanket-forcing q50 to CPU (slow on a large route with
+--retune), q50 now tries GPU first (same as q05/q95) and automatically
+detects divergence (non-finite predictions on the eval set) after each fit;
+only THAT specific fit is transparently redone on CPU, with a printed
+warning, and training continues. If GPU works fine for q50 on your build,
+you pay zero CPU cost; if it diverges, you get a correct result instead of
+silently-corrupted ones (previously, fix_quantile_crossing() would relabel
+the good q95 prediction as "q50" once q50's own prediction hit inf).
+
 USAGE:
     Edit DATA_PATH below, then:
         python train_save_script21_huber_q50.py                        # CPU, defaults (fast)
-        python train_save_script21_huber_q50.py --gpu                  # GPU, defaults
+        python train_save_script21_huber_q50.py --gpu                  # GPU, defaults (q50 falls back to CPU only if it diverges)
         python train_save_script21_huber_q50.py --huber-slope 1.5      # override Huber slope
         python train_save_script21_huber_q50.py --retune --n_trials 50 # CPU + Optuna (~9 hr)
         python train_save_script21_huber_q50.py --retune --gpu         # GPU + Optuna (~2 hr if GPU works)
@@ -93,6 +106,42 @@ DEFAULT_PARAMS_STANDARD = {
 
 # Module-level XGB kwargs (overwritten by main() based on --gpu)
 XGB_KWARGS_GLOBAL = {'tree_method': 'hist'}
+CPU_KWARGS = {'tree_method': 'hist'}
+HUBER_GPU_FALLBACK_LOG = []  # labels of fits where GPU diverged and CPU fallback kicked in
+
+
+def fit_huber_with_gpu_fallback(build_kwargs, X_tr, y_tr, X_va, y_va, label):
+    """Fit an XGBRegressor(objective='reg:pseudohubererror', ...) using
+    XGB_KWARGS_GLOBAL (GPU if --gpu was passed), then check whether the fit
+    actually converged. On at least one observed CUDA build,
+    reg:pseudohubererror on device='cuda' can diverge within the first
+    boosting round (log1p-space predictions blow up -> np.expm1 overflow ->
+    inf pinball -> best_iteration=0), while reg:quantileerror trains
+    normally on the same GPU/data — so this is checked/handled only for the
+    Huber q50 model, not q05/q95.
+
+    If the eval-set predictions are non-finite, print a warning and
+    transparently refit the identical config on CPU instead, so training
+    never silently returns a diverged model (which fix_quantile_crossing()
+    would otherwise relabel as a valid "q50" using the real q95 prediction).
+    Returns the model that actually converged.
+    """
+    use_gpu = XGB_KWARGS_GLOBAL.get('device') == 'cuda'
+    kwargs = {**build_kwargs, **XGB_KWARGS_GLOBAL}
+    m = XGBRegressor(**kwargs)
+    m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+
+    if use_gpu and not np.all(np.isfinite(m.predict(X_va))):
+        print(f"  [{label}] WARNING: reg:pseudohubererror diverged on GPU "
+              f"(non-finite eval-set predictions) — refitting on CPU...")
+        HUBER_GPU_FALLBACK_LOG.append(label)
+        kwargs_cpu = {**build_kwargs, **CPU_KWARGS}
+        m = XGBRegressor(**kwargs_cpu)
+        m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        if not np.all(np.isfinite(m.predict(X_va))):
+            print(f"  [{label}] WARNING: still diverged on CPU — this is not "
+                  f"a GPU-only issue; consider a larger --huber-slope.")
+    return m
 
 
 # ============================================================
@@ -115,6 +164,19 @@ def coverage(y, p_low, p_high):
 def pinball_loss(y_true, y_pred, alpha):
     diff = y_true - y_pred
     return float(np.mean(np.maximum(alpha * diff, (alpha - 1) * diff)))
+
+def safe_expm1(log_pred, log_cap=20.0):
+    """np.expm1 with the input pre-clipped to [-log_cap, log_cap]. Defense in
+    depth for the Huber q50 experiment: if a model's raw log1p-space
+    prediction ever diverges (observed on at least one CUDA build for
+    reg:pseudohubererror), a plain np.expm1 would overflow to inf, which
+    fix_quantile_crossing() would then silently relabel as a valid "q50"
+    prediction (using the real q95 value) instead of erroring. Clipping the
+    input keeps the result finite (but still obviously wrong/huge) so bad
+    fits show up as a bad metric, not a silently-corrupted one.
+    expm1(20) ~= $485 million — far above any plausible sale value, but
+    comfortably below float64's overflow threshold (~709.78)."""
+    return np.expm1(np.clip(log_pred, -log_cap, log_cap))
 
 
 # ============================================================
@@ -168,14 +230,16 @@ def tune_quantile(name, X_tr, y_tr_adj, X_va, y_va_adj, monotone, quantile_alpha
             'gamma'           : trial.suggest_categorical('gamma', [0.0, 0.1, 0.5]),
         }
         if use_huber:
-            m = XGBRegressor(
+            build_kwargs = dict(
                 objective='reg:pseudohubererror', huber_slope=huber_slope,
                 monotone_constraints=monotone,
                 early_stopping_rounds=50,
                 random_state=SEED, n_jobs=-1,
-                **XGB_KWARGS_GLOBAL,
                 **params,
             )
+            m = fit_huber_with_gpu_fallback(
+                build_kwargs, X_tr, np.log1p(y_tr_adj), X_va, np.log1p(y_va_adj),
+                label=f"{name}-optuna-trial")
         else:
             m = XGBRegressor(
                 objective='reg:quantileerror', quantile_alpha=quantile_alpha,
@@ -185,9 +249,9 @@ def tune_quantile(name, X_tr, y_tr_adj, X_va, y_va_adj, monotone, quantile_alpha
                 **XGB_KWARGS_GLOBAL,
                 **params,
             )
-        m.fit(X_tr, np.log1p(y_tr_adj),
-              eval_set=[(X_va, np.log1p(y_va_adj))], verbose=False)
-        pred_va = np.expm1(m.predict(X_va))
+            m.fit(X_tr, np.log1p(y_tr_adj),
+                  eval_set=[(X_va, np.log1p(y_va_adj))], verbose=False)
+        pred_va = safe_expm1(m.predict(X_va))
         return pinball_loss(y_va_adj, pred_va, quantile_alpha)
 
     print(f"  [{name}] Optuna: {n_trials} trials for quantile={quantile_alpha}")
@@ -246,15 +310,17 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
 
         if qlab == "q50":
             # Experiment: Huber loss instead of quantile loss for the median model.
-            model = XGBRegressor(
+            build_kwargs = dict(
                 objective='reg:pseudohubererror', huber_slope=args.huber_slope,
                 n_estimators=3000,
                 monotone_constraints=monotone,
                 early_stopping_rounds=75,
                 random_state=SEED, n_jobs=-1,
-                **XGB_KWARGS_GLOBAL,
                 **params,
             )
+            model = fit_huber_with_gpu_fallback(
+                build_kwargs, X_es_tr, np.log1p(y_adj_tr), X_es_va, np.log1p(y_adj_va),
+                label=f"{name}-{qlab}")
         else:
             model = XGBRegressor(
                 objective='reg:quantileerror', quantile_alpha=q,
@@ -265,10 +331,10 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
                 **XGB_KWARGS_GLOBAL,
                 **params,
             )
-        model.fit(X_es_tr, np.log1p(y_adj_tr),
-                  eval_set=[(X_es_va, np.log1p(y_adj_va))], verbose=False)
+            model.fit(X_es_tr, np.log1p(y_adj_tr),
+                      eval_set=[(X_es_va, np.log1p(y_adj_va))], verbose=False)
 
-        pred_adj = np.clip(np.expm1(model.predict(X_test)), 1, None)
+        pred_adj = np.clip(safe_expm1(model.predict(X_test)), 1, None)
         pred_nom = np.clip(deflate_pred(pred_adj, R_test, config['alpha']), 1, None)
         models[qlab] = model
         preds_test[qlab] = pred_nom
@@ -519,7 +585,7 @@ def main():
         X_train_cult = pre_cult.transform(train_cult_raw)
         R_train_cult = cpi_ratio_arr(train_cult_raw)
         for qlab in QUANTILE_LABELS:
-            pred_adj = np.clip(np.expm1(models_cult[qlab].predict(X_train_cult)), 1, None)
+            pred_adj = np.clip(safe_expm1(models_cult[qlab].predict(X_train_cult)), 1, None)
             pred_nom = np.clip(deflate_pred(pred_adj, R_train_cult, CULT_CONFIG['alpha']), 1, None)
             train_preds[qlab][train_cult_flag] = pred_nom
 
@@ -528,7 +594,7 @@ def main():
         X_train_std = pre_std.transform(train_std_raw)
         R_train_std = cpi_ratio_arr(train_std_raw)
         for qlab in QUANTILE_LABELS:
-            pred_adj = np.clip(np.expm1(models_std[qlab].predict(X_train_std)), 1, None)
+            pred_adj = np.clip(safe_expm1(models_std[qlab].predict(X_train_std)), 1, None)
             pred_nom = np.clip(deflate_pred(pred_adj, R_train_std, STANDARD_CONFIG['alpha']), 1, None)
             train_preds[qlab][~train_cult_flag] = pred_nom
 
@@ -765,6 +831,7 @@ def main():
             'model_type': 'script21_routed_quantile',
             'q50_objective': 'reg:pseudohubererror',
             'huber_slope': args.huber_slope,
+            'huber_gpu_fallback_triggered_for': list(HUBER_GPU_FALLBACK_LOG),
             'quantiles': QUANTILES,
             'cult_alpha': CULT_CONFIG['alpha'],
             'standard_alpha': STANDARD_CONFIG['alpha'],
