@@ -63,6 +63,26 @@ STANDARD_CONFIG = {
     'use_macro': True, 'use_geo': True, 'use_cult': False,
 }
 
+# DataOne-sourced vehicle spec features. Resolved via schema_adapter's
+# NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the preprocessor actually
+# sees (raw incoming DB field name -> legacy name in the comments below).
+# Gated by the --use-dataone CLI flag (see main()): when OFF (default) these
+# are excluded via SaleValuePreprocessor(extra_drop_cols=...); when ON they
+# flow through untouched. script21-only: preprocessor.py's shared class
+# defaults (used by script17 too) are unaffected either way.
+DATAONE_FEATURES = [
+    'oem_body_style',       # raw 'body_type'          -> legacy 'oem_body_style'
+    'drive_type',           # raw 'drive_type'         -> legacy 'drive_type' (no rename)
+    'engine_name',          # raw 'engines_name'       -> legacy 'engine_name'
+    'engineconfiguration',  # raw 'ice_block_type'     -> legacy 'engineconfiguration'
+    'enginecylinders',      # raw 'ice_cylinders'      -> legacy 'enginecylinders'
+    'displacementl',        # raw 'ice_displacement'   -> legacy 'displacementl'
+    'enginehp',             # raw 'ice_max_hp'         -> legacy 'enginehp'
+    'msrp',                 # raw 'msrp'               -> legacy 'msrp' (no rename)
+    'transmission_name',    # raw 'transmissions_name' -> legacy 'transmission_name'
+    'us_style_name',        # raw 'us_styles'          -> legacy 'us_style_name'
+]
+
 DEFAULT_PARAMS_CULT = {
     "q05": dict(learning_rate=0.03, max_depth=8, min_child_weight=20,
                 subsample=0.7, colsample_bytree=0.7,
@@ -187,12 +207,13 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
     print(f"\n[{name}] Preprocessing (train_n={len(train_subset):,}, test_n={len(test_subset):,})...")
     enabled_new_features = [c.strip() for c in args.enable_new_features.split(",") if c.strip()]
     new_features_drop_cols = [c for c in NEW_FEATURE_COLS if c not in enabled_new_features]
+    dataone_drop_cols = [] if args.use_dataone else DATAONE_FEATURES
     pre = SaleValuePreprocessor(
         time_col=TIME_COL, seed=SEED,
         use_macro=config['use_macro'], use_geo=config['use_geo'], use_cult=config['use_cult'],
         with_target_encoding=False,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
-        extra_drop_cols=new_features_drop_cols,
+        extra_drop_cols=new_features_drop_cols + dataone_drop_cols,
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -301,6 +322,10 @@ def main():
                              "features (from commit 20c8c17). Default: none (exact "
                              "2406a7a checkpoint behavior — these columns are dropped). "
                              "Example: --enable-new-features true_mileage_unknown,clean_title")
+    parser.add_argument("--use-dataone", action='store_true',
+                        help="Include DataOne-sourced vehicle spec features "
+                             f"({', '.join(DATAONE_FEATURES)}) in training. "
+                             "Default: false (these features are excluded).")
     args = parser.parse_args()
 
     if not (0 < args.cap_pct <= 100):
@@ -315,6 +340,13 @@ def main():
                      f"choose from {NEW_FEATURE_COLS}")
     new_features_drop_cols = [c for c in NEW_FEATURE_COLS if c not in enabled_new_features]
     print(f">>> New features enabled: {enabled_new_features or '(none — 2406a7a baseline)'}")
+
+    if args.use_dataone:
+        print(">>> DataOne features ENABLED (--use-dataone): "
+              f"{DATAONE_FEATURES} will be used for training")
+    else:
+        print(">>> DataOne features DISABLED (default): "
+              f"{DATAONE_FEATURES} will be excluded from training")
 
     global XGB_KWARGS_GLOBAL
     if args.gpu:
@@ -754,6 +786,8 @@ def main():
             'min_salevalue': args.min_salevalue,
             'enabled_new_features': enabled_new_features,
             'new_features_excluded': new_features_drop_cols,
+            'use_dataone': bool(args.use_dataone),
+            'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
             'save_shap_used': bool(args.save_shap),
             'save_shap_global_used': bool(args.save_shap or args.save_shap_global),
             'n_optuna_trials_per_quantile': args.n_trials if args.retune else 0,

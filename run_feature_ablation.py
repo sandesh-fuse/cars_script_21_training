@@ -63,7 +63,10 @@ def run_group(name, features, args):
     ]
     if args.gpu:
         cmd.append("--gpu")
-    print(f"\n{'=' * 100}\nGROUP {name}: enabling {features}\n{'=' * 100}")
+    if args.use_dataone:
+        cmd.append("--use-dataone")
+    print(f"\n{'=' * 100}\nGROUP {name}: enabling {features}"
+          f" (dataone {'ON' if args.use_dataone else 'OFF'})\n{'=' * 100}")
     print("  $", " ".join(cmd))
     t0 = time.time()
     log_path = f"ablation_{name}.log"
@@ -123,6 +126,9 @@ def main():
                              "cult_cars_fixed.xlsx is a renamed-sheet copy (see repo root).")
     parser.add_argument("--baseline-predictions", default="test_predictions.csv")
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--use-dataone", action="store_true",
+                        help="Forward --use-dataone to every training subprocess "
+                             "(default off, matching train_save_script21.py's default).")
     parser.add_argument("--only", default=None,
                         help="Comma-separated subset of group names to run (default: all 3)")
     args = parser.parse_args()
