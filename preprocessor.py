@@ -44,14 +44,26 @@ NEW_FEATURE_COLS = ['true_mileage_unknown', 'clean_title', 'gvm_range', 'tonnage
 # mechanical severity, and cult routing not being interacted with
 # mileage/age, none of which existed before. Gated by
 # SaleValuePreprocessor(enable_worst_tier_features=...) / script21's
-# --disable-worst-tier-features so they can be ablated the same way
+# --enable-worst-tier-features so they can be ablated the same way
 # NEW_FEATURE_COLS/--enable-new-features is. Unlike NEW_FEATURE_COLS these
 # aren't raw input columns to drop — they're derived from always-on
 # engineered columns (n_unknowns, mileage_bucket, is_cult, ...) — so the
-# gate is a plain boolean, not an extra_drop_cols entry.
+# gate is a plain boolean/name-list, not an extra_drop_cols entry.
 WORST_TIER_FEATURE_COLS = [
     'unknowns_x_mileage_bkt', 'unknowns_x_age_bkt', 'mech_severity_x_mileage_bkt',
     'cult_x_n_unknowns', 'vtype_x_mileage_bkt', 'mileage_unknown_x_n_unknowns',
+]
+
+# Interaction features targeting the $100-2000 tier instead (most vehicle
+# volume): the correlation analysis there (worst_case_analysis_100_2000/)
+# showed a DIFFERENT pattern than $2.5K-10K -- worst-overpredicted rows
+# have BETTER-looking condition (more "Operational"/"Runs & Drives", less
+# damage reported) than the rest of the band, not missing data. The model
+# applies one global "good condition -> higher price" rule regardless of
+# make; these features let it learn a make-specific version of that rule
+# instead. Gated the same way as WORST_TIER_FEATURE_COLS (see _cmf()).
+CONDITION_MAKE_FEATURE_COLS = [
+    'runs_x_make', 'mech_severity_x_make', 'all_cond_combo_x_make',
 ]
 
 # ============================================================
@@ -345,6 +357,8 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         'mileage_unknown_x_make',
         # Worst-case-tier interaction (string-concat → freq-encoded)
         'vtype_x_mileage_bkt',
+        # Condition-x-make interactions ($100-2000 tier, string-concat → freq-encoded)
+        'runs_x_make', 'mech_severity_x_make', 'all_cond_combo_x_make',
     ]
     GEO_FREQ_COLS = [
         'zip_region_x_vehicle_type','zip_region_x_body_type','zip_region_x_nav_condition',
@@ -399,7 +413,8 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                  with_target_encoding=False, smoothing=20, n_folds=5,
                  zip_lat_map=None, zip_lon_map=None, cult_lookup=None,
                  n_clusters=12, cluster_min_samples=50,
-                 extra_drop_cols=None, enable_worst_tier_features=True):
+                 extra_drop_cols=None, enable_worst_tier_features=True,
+                 enable_condition_make_features=True):
         self.time_col = time_col
         self.seed     = seed
         self.use_macro = use_macro
@@ -411,6 +426,9 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # {'unknowns_x_mileage_bkt'}) so each can be ablation-tested one at
         # a time. See _wtf().
         self.enable_worst_tier_features = enable_worst_tier_features
+        # See CONDITION_MAKE_FEATURE_COLS. Same True/False/iterable
+        # convention as enable_worst_tier_features above. See _cmf().
+        self.enable_condition_make_features = enable_condition_make_features
         self.with_target_encoding = with_target_encoding
         self.smoothing = smoothing
         self.n_folds   = n_folds
@@ -437,6 +455,15 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         False (all off), or an iterable of specific names to enable one at
         a time (see --enable-worst-tier-features in train_save_script21.py)."""
         v = self.enable_worst_tier_features
+        if isinstance(v, bool):
+            return v
+        return name in v
+
+    def _cmf(self, name):
+        """Same as _wtf() but for CONDITION_MAKE_FEATURE_COLS /
+        enable_condition_make_features (see --enable-condition-make-features
+        in train_save_script21.py)."""
+        v = self.enable_condition_make_features
         if isinstance(v, bool):
             return v
         return name in v
@@ -899,6 +926,29 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             # exactly the kind of body-type premium the $2.5K-10K tier's
             # systematic underprediction is missing.
             X['vtype_x_mileage_bkt'] = cc(X['vehicle_type'], X['mileage_bucket'].astype(str))
+
+        # Condition-x-make interactions ($100-2000 tier): the correlation
+        # analysis there (worst_case_analysis_100_2000/) found the worst-
+        # overpredicted rows have BETTER condition signals (more
+        # "Operational"/"Runs & Drives", less damage reported) than the
+        # rest of the band, not worse -- the model applies one global
+        # "good condition -> higher price" rule regardless of make. These
+        # let it learn a make-specific version of that rule instead. See
+        # CONDITION_MAKE_FEATURE_COLS / _cmf().
+        if self._cmf('runs_x_make') and {'runs_flag', 'make'}.issubset(X.columns):
+            X['runs_x_make'] = cc(X['runs_flag'].astype(str), X['make'])
+        if self._cmf('mech_severity_x_make') and {'mechanical_severity_mean', 'make'}.issubset(X.columns):
+            # Bucketed (not the raw decimal) so each make x severity-band
+            # combo has enough rows to give a meaningful frequency count --
+            # matches the enginehp_bucket/age_bucket precedent elsewhere in
+            # this file. Bands: 0 = perfect, 1 = minor issues, 2 = major/
+            # heavily-unknown; -1 = no severity signal at all (all three
+            # source condition fields missing).
+            sev_bkt = pd.cut(X['mechanical_severity_mean'], bins=[-np.inf, 0, 2, np.inf], labels=False)
+            sev_bkt = sev_bkt.fillna(-1).astype(int)
+            X['mech_severity_x_make'] = cc(sev_bkt.astype(str), X['make'])
+        if self._cmf('all_cond_combo_x_make') and {'all_cond_combo', 'make'}.issubset(X.columns):
+            X['all_cond_combo_x_make'] = cc(X['all_cond_combo'], X['make'])
 
         # Engine-derived interactions (use parsed engine features from _basic_clean)
         # All four are added if their source columns are present; otherwise skipped silently.

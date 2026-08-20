@@ -34,6 +34,7 @@ from xgboost import XGBRegressor
 
 from preprocessor import (
     SaleValuePreprocessor, MONO_FEATURES, NEW_FEATURE_COLS, WORST_TIER_FEATURE_COLS,
+    CONDITION_MAKE_FEATURE_COLS,
     TARGET_COL, TIME_COL,
     build_cult_lookup, build_zip_lookup, compute_cult_flag,
     cpi_ratio_arr, adjust_target, deflate_pred,
@@ -110,14 +111,13 @@ DEFAULT_PARAMS_STANDARD = {
 XGB_KWARGS_GLOBAL = {'tree_method': 'hist'}
 
 
-def resolve_worst_tier_features(raw):
-    """Parse --enable-worst-tier-features into what
-    SaleValuePreprocessor(enable_worst_tier_features=...) expects: True
-    (all 6 on), False (all off), or a list of specific column names (test
-    one -- or a few -- at a time). Mirrors --enable-new-features's
-    comma-separated-list convention, plus 'all'/'none' shorthands since
-    "all 6 on" is the default (unlike --enable-new-features, whose default
-    is "none").
+def _resolve_feature_toggle(raw, valid_cols, flag_name):
+    """Shared parser behind resolve_worst_tier_features() and
+    resolve_condition_make_features(): True (all on), False (all off), or a
+    list of specific column names (test one -- or a few -- at a time).
+    Mirrors --enable-new-features's comma-separated-list convention, plus
+    'all'/'none' shorthands since "all on" is the default here (unlike
+    --enable-new-features, whose default is "none").
     """
     val = raw.strip().lower()
     if val in ("all", ""):
@@ -125,12 +125,24 @@ def resolve_worst_tier_features(raw):
     if val == "none":
         return False
     names = [c.strip() for c in raw.split(",") if c.strip()]
-    unknown = set(names) - set(WORST_TIER_FEATURE_COLS)
+    unknown = set(names) - set(valid_cols)
     if unknown:
         raise ValueError(
-            f"--enable-worst-tier-features: unrecognized column(s) {sorted(unknown)}; "
-            f"choose from {WORST_TIER_FEATURE_COLS}, or 'all'/'none'")
+            f"{flag_name}: unrecognized column(s) {sorted(unknown)}; "
+            f"choose from {valid_cols}, or 'all'/'none'")
     return names
+
+
+def resolve_worst_tier_features(raw):
+    """Parse --enable-worst-tier-features into what
+    SaleValuePreprocessor(enable_worst_tier_features=...) expects."""
+    return _resolve_feature_toggle(raw, WORST_TIER_FEATURE_COLS, "--enable-worst-tier-features")
+
+
+def resolve_condition_make_features(raw):
+    """Parse --enable-condition-make-features into what
+    SaleValuePreprocessor(enable_condition_make_features=...) expects."""
+    return _resolve_feature_toggle(raw, CONDITION_MAKE_FEATURE_COLS, "--enable-condition-make-features")
 
 
 # ============================================================
@@ -238,6 +250,7 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
         extra_drop_cols=new_features_drop_cols + dataone_drop_cols,
         enable_worst_tier_features=resolve_worst_tier_features(args.enable_worst_tier_features),
+        enable_condition_make_features=resolve_condition_make_features(args.enable_condition_make_features),
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -358,6 +371,14 @@ def main():
                              "--enable-worst-tier-features unknowns_x_mileage_bkt. "
                              "'none' reproduces the pre-worst-tier-interactions baseline. "
                              "See worst_case_analysis_2500_10000/.")
+    parser.add_argument("--enable-condition-make-features", default="all",
+                        help="Which condition-x-make interaction features to include "
+                             f"(targets the $100-2000 tier), comma-separated subset of "
+                             f"{{{','.join(CONDITION_MAKE_FEATURE_COLS)}}}, or 'all' (default) / "
+                             "'none'. Use a single name to ablation-test that one feature "
+                             "in isolation, e.g. --enable-condition-make-features runs_x_make. "
+                             "'none' reproduces the pre-condition-make-interactions baseline. "
+                             "See worst_case_analysis_100_2000/.")
     args = parser.parse_args()
 
     if not (0 < args.cap_pct <= 100):
@@ -378,6 +399,12 @@ def main():
     except ValueError as e:
         parser.error(str(e))
     print(f">>> Worst-tier interaction features enabled: {worst_tier_features_resolved}")
+
+    try:
+        condition_make_features_resolved = resolve_condition_make_features(args.enable_condition_make_features)
+    except ValueError as e:
+        parser.error(str(e))
+    print(f">>> Condition-x-make interaction features enabled: {condition_make_features_resolved}")
 
     if args.use_dataone:
         print(">>> DataOne features ENABLED (--use-dataone): "
@@ -843,6 +870,7 @@ def main():
             'enabled_new_features': enabled_new_features,
             'new_features_excluded': new_features_drop_cols,
             'worst_tier_features_enabled': worst_tier_features_resolved,
+            'condition_make_features_enabled': condition_make_features_resolved,
             'use_dataone': bool(args.use_dataone),
             'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
             'save_shap_used': bool(args.save_shap),
