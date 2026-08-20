@@ -38,6 +38,22 @@ BASE_MONTH = 4
 # behavior (none enabled) is byte-identical to the 2406a7a checkpoint.
 NEW_FEATURE_COLS = ['true_mileage_unknown', 'clean_title', 'gvm_range', 'tonnage', 'engine_type']
 
+# Interaction features added to target the $2.5K-10K worst-dollar-error tier
+# (see worst_case_analysis_2500_10000/tier_band_feature_correlation.md):
+# systematic underprediction there correlates with condition-unknown counts,
+# mechanical severity, and cult routing not being interacted with
+# mileage/age, none of which existed before. Gated by
+# SaleValuePreprocessor(enable_worst_tier_features=...) / script21's
+# --disable-worst-tier-features so they can be ablated the same way
+# NEW_FEATURE_COLS/--enable-new-features is. Unlike NEW_FEATURE_COLS these
+# aren't raw input columns to drop — they're derived from always-on
+# engineered columns (n_unknowns, mileage_bucket, is_cult, ...) — so the
+# gate is a plain boolean, not an extra_drop_cols entry.
+WORST_TIER_FEATURE_COLS = [
+    'unknowns_x_mileage_bkt', 'unknowns_x_age_bkt', 'mech_severity_x_mileage_bkt',
+    'cult_x_n_unknowns', 'vtype_x_mileage_bkt', 'mileage_unknown_x_n_unknowns',
+]
+
 # ============================================================
 # MACRO DATA
 # ============================================================
@@ -327,6 +343,8 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         'gvm_range', 'body_subtype', 'engine_type',
         # Mileage-trust interaction (string-concat → freq-encoded)
         'mileage_unknown_x_make',
+        # Worst-case-tier interaction (string-concat → freq-encoded)
+        'vtype_x_mileage_bkt',
     ]
     GEO_FREQ_COLS = [
         'zip_region_x_vehicle_type','zip_region_x_body_type','zip_region_x_nav_condition',
@@ -381,12 +399,16 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                  with_target_encoding=False, smoothing=20, n_folds=5,
                  zip_lat_map=None, zip_lon_map=None, cult_lookup=None,
                  n_clusters=12, cluster_min_samples=50,
-                 extra_drop_cols=None):
+                 extra_drop_cols=None, enable_worst_tier_features=True):
         self.time_col = time_col
         self.seed     = seed
         self.use_macro = use_macro
         self.use_geo   = use_geo
         self.use_cult  = use_cult
+        # See WORST_TIER_FEATURE_COLS. Default True (on) — these are new,
+        # not part of the 2406a7a baseline; set False to reproduce the
+        # baseline for ablation comparisons.
+        self.enable_worst_tier_features = enable_worst_tier_features
         self.with_target_encoding = with_target_encoding
         self.smoothing = smoothing
         self.n_folds   = n_folds
@@ -777,6 +799,23 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # USER_DROP_COLS in the class header.
         if {'age','n_unknowns'}.issubset(X.columns):
             X['old_and_unknown'] = ((X['age'] >= 15) & (X['n_unknowns'] >= 3)).astype(int)
+
+        # Worst-case-tier interactions ($2.5K-10K band): the tier/field
+        # correlation analysis (worst_case_analysis_2500_10000/) showed
+        # condition-unknown counts and mechanical severity correlate with
+        # systematic underprediction in this band far more than in the
+        # $100-2.5K band, but neither is interacted with mileage/age today.
+        # Numeric x numeric/bucket interactions, matching the cult_x_age /
+        # mileage_unknown_x_age pattern (plain multiplication, trees handle
+        # the rest).
+        if self.enable_worst_tier_features and {'n_unknowns','mileage_bucket'}.issubset(X.columns):
+            X['unknowns_x_mileage_bkt'] = X['n_unknowns'] * X['mileage_bucket']
+        if self.enable_worst_tier_features and {'n_unknowns','age_bucket'}.issubset(X.columns):
+            X['unknowns_x_age_bkt'] = X['n_unknowns'] * X['age_bucket']
+        if self.enable_worst_tier_features and {'mechanical_severity_mean','mileage_bucket'}.issubset(X.columns):
+            X['mech_severity_x_mileage_bkt'] = (
+                X['mechanical_severity_mean'].fillna(-1) * X['mileage_bucket']
+            )
         def cc(*cols):
             out = cols[0].fillna('na').astype(str)
             for c in cols[1:]: out = out + '__' + c.fillna('na').astype(str)
@@ -819,6 +858,12 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                 X['culttier_x_age'] = X['cult_tier_num'].fillna(0) * X['age'].fillna(-1)
             if 'cult_origsens_num' in X.columns and 'runs_flag' in X.columns:
                 X['origsens_x_runs'] = X['cult_origsens_num'].fillna(-1) * X['runs_flag']
+            if self.enable_worst_tier_features and 'n_unknowns' in X.columns:
+                # Cult route shows its own elevated MAE (by_route breakdown);
+                # missing condition data plausibly discounts value less on a
+                # cult car (make/model desirability dominates) than on a
+                # standard one. Never interacted with completeness before.
+                X['cult_x_n_unknowns'] = X['is_cult'] * X['n_unknowns']
 
         # Additional interaction features (user-requested).
         #   - string-concat interactions become frequency-encoded later
@@ -835,6 +880,13 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['zip_region_x_mileage_bkt'] = cc(X['zip_region'], X['mileage_bucket'].astype(str))
         if {'quarter','make'}.issubset(X.columns):
             X['quarter_x_make'] = cc(X['quarter'].astype(str), X['make'])
+        if self.enable_worst_tier_features and {'vehicle_type','mileage_bucket'}.issubset(X.columns):
+            # vehicle_type is already combined with make/nav_condition/zip
+            # region but never with mileage — trucks/vans/SUVs plausibly
+            # hold value on a different mileage curve than sedans, which is
+            # exactly the kind of body-type premium the $2.5K-10K tier's
+            # systematic underprediction is missing.
+            X['vtype_x_mileage_bkt'] = cc(X['vehicle_type'], X['mileage_bucket'].astype(str))
 
         # Engine-derived interactions (use parsed engine features from _basic_clean)
         # All four are added if their source columns are present; otherwise skipped silently.
@@ -896,6 +948,15 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         if {'true_mileage_unknown', 'make'}.issubset(X.columns):
             X['mileage_unknown_x_make'] = cc(
                 X['true_mileage_unknown'].fillna(-1).astype(str), X['make']
+            )
+        if self.enable_worst_tier_features and {'true_mileage_unknown', 'n_unknowns'}.issubset(X.columns):
+            # Compounding data-quality signal: true_mileage_unknown and
+            # condition-unknown count move together in the $2.5K-10K worst-
+            # underpredicted rows (both show ~+22pp lift there) but were
+            # never interacted with each other, only separately with
+            # age/mileage_bucket/make.
+            X['mileage_unknown_x_n_unknowns'] = (
+                X['true_mileage_unknown'].fillna(0) * X['n_unknowns']
             )
 
         # Clean-title interactions (clean_title: 1 = clean title, vs.

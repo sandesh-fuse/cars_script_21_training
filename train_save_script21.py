@@ -33,7 +33,7 @@ import pandas as pd
 from xgboost import XGBRegressor
 
 from preprocessor import (
-    SaleValuePreprocessor, MONO_FEATURES, NEW_FEATURE_COLS,
+    SaleValuePreprocessor, MONO_FEATURES, NEW_FEATURE_COLS, WORST_TIER_FEATURE_COLS,
     TARGET_COL, TIME_COL,
     build_cult_lookup, build_zip_lookup, compute_cult_flag,
     cpi_ratio_arr, adjust_target, deflate_pred,
@@ -214,6 +214,7 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         with_target_encoding=False,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
         extra_drop_cols=new_features_drop_cols + dataone_drop_cols,
+        enable_worst_tier_features=not args.disable_worst_tier_features,
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -326,6 +327,12 @@ def main():
                         help="Include DataOne-sourced vehicle spec features "
                              f"({', '.join(DATAONE_FEATURES)}) in training. "
                              "Default: false (these features are excluded).")
+    parser.add_argument("--disable-worst-tier-features", action='store_true',
+                        help="Disable the $2.5K-10K worst-dollar-error-tier "
+                             f"interaction features ({', '.join(WORST_TIER_FEATURE_COLS)}). "
+                             "Default: false (enabled) — pass this flag to reproduce "
+                             "the pre-worst-tier-interactions baseline for ablation "
+                             "comparisons. See worst_case_analysis_2500_10000/.")
     args = parser.parse_args()
 
     if not (0 < args.cap_pct <= 100):
@@ -804,6 +811,7 @@ def main():
             'min_salevalue': args.min_salevalue,
             'enabled_new_features': enabled_new_features,
             'new_features_excluded': new_features_drop_cols,
+            'worst_tier_features_enabled': not args.disable_worst_tier_features,
             'use_dataone': bool(args.use_dataone),
             'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
             'save_shap_used': bool(args.save_shap),
