@@ -1,31 +1,33 @@
 """
 run_worst_tier_ablation.py
 ============================
-Ablation-tests the 6 new interaction features added to target the
-$2.5K-10K worst-dollar-error tier (see
-worst_case_analysis_2500_10000/tier_band_feature_correlation.md and
-WORST_TIER_FEATURE_COLS in preprocessor.py):
+Ablation-tests the 6 new interaction features added to target
+under/overpredicted vehicles (see WORST_TIER_FEATURE_COLS in
+preprocessor.py and worst_case_analysis_2500_10000/tier_band_feature_
+correlation.md for where the underlying evidence came from):
 
   unknowns_x_mileage_bkt, unknowns_x_age_bkt, mech_severity_x_mileage_bkt,
   cult_x_n_unknowns, vtype_x_mileage_bkt, mileage_unknown_x_n_unknowns
 
-Trains two script21 models via subprocess calls to train_save_script21.py:
-
-  baseline  -- python train_save_script21.py --disable-worst-tier-features
-  new       -- python train_save_script21.py   (features enabled, default)
-
-then evaluates both the same way train_save_script21.py always does
+Tests each ONE AT A TIME against a shared baseline (--enable-worst-tier-
+features none) -- not cumulative, not all-6-at-once -- via subprocess
+calls to train_save_script21.py's --enable-worst-tier-features flag, then
+evaluates every run the same way train_save_script21.py always does
 (test_metrics.json via evaluate_predictions.evaluate()) and renders a
-combined overall + per-tier comparison table, mirroring
-run_feature_ablation.py's format. Unlike run_feature_ablation.py this
-compares exactly 2 groups (features off vs on) since all 6 are one bundle
-gated by a single flag, not independently toggleable columns.
+combined overall + per-tier comparison table.
+
+Most of the vehicle volume (and the tier this repo's business priority
+targets) sits in $100-2000, not the sparser $2.5K-10K tail the features
+were originally diagnosed against -- watch the $0-200 / $200-500 /
+$500-1K / $1K-2.5K rows in the output first; the $2.5K+ rows are still
+printed for reference but are the secondary concern here.
 
 USAGE:
-    python run_worst_tier_ablation.py
+    python run_worst_tier_ablation.py                          # baseline + all 6, one at a time
+    python run_worst_tier_ablation.py --only unknowns_x_mileage_bkt
+    python run_worst_tier_ablation.py --only baseline,unknowns_x_mileage_bkt,unknowns_x_age_bkt
+    python run_worst_tier_ablation.py --include-all-combined    # + a 7th group: all 6 together
     python run_worst_tier_ablation.py --gpu
-    python run_worst_tier_ablation.py --use-dataone
-    python run_worst_tier_ablation.py --enable-new-features true_mileage_unknown,clean_title
 """
 import os
 import sys
@@ -37,11 +39,18 @@ import time
 import pandas as pd
 
 from evaluate_predictions import evaluate, TIER_LABELS
+from preprocessor import WORST_TIER_FEATURE_COLS
 
-GROUPS = [
-    ("baseline_worst_tier_off", True),   # (name, pass --disable-worst-tier-features)
-    ("new_worst_tier_on",       False),
-]
+BASELINE_NAME = "baseline"
+
+
+def build_groups(include_all_combined):
+    groups = [(BASELINE_NAME, "none")]
+    groups += [(name, name) for name in WORST_TIER_FEATURE_COLS]
+    if include_all_combined:
+        groups.append(("all_combined", "all"))
+    return groups
+
 
 METRIC_KEYS = [
     ("N", "N", "{:,.0f}"),
@@ -53,25 +62,28 @@ METRIC_KEYS = [
     ("bias_p50", "Bias", "${:+,.0f}"),
 ]
 
+# Tiers where most volume and current business priority sit -- printed
+# first in the summary. The rest of TIER_LABELS still appears in the full
+# per-tier table below for reference.
+PRIORITY_TIERS = ["$0-200", "$200-500", "$500-1K", "$1K-2.5K"]
 
-def run_group(name, disable_flag, args):
+
+def run_group(name, enable_value, args):
     out_dir = os.path.join("artifacts", f"script21_ablation_{name}")
     cmd = [
         sys.executable, "train_save_script21.py",
         "--data", args.data,
         "--cult", args.cult,
         "--out", out_dir,
+        "--enable-worst-tier-features", enable_value,
     ]
-    if disable_flag:
-        cmd.append("--disable-worst-tier-features")
     if args.enable_new_features:
         cmd += ["--enable-new-features", args.enable_new_features]
     if args.gpu:
         cmd.append("--gpu")
     if args.use_dataone:
         cmd.append("--use-dataone")
-    print(f"\n{'=' * 100}\nGROUP {name}: worst-tier features "
-          f"{'DISABLED' if disable_flag else 'ENABLED'}\n{'=' * 100}")
+    print(f"\n{'=' * 100}\nGROUP {name}: --enable-worst-tier-features {enable_value}\n{'=' * 100}")
     print("  $", " ".join(cmd))
     t0 = time.time()
     log_path = f"worst_tier_ablation_{name}.log"
@@ -88,8 +100,6 @@ def run_group(name, disable_flag, args):
 
 
 def metrics_rows(label, metrics):
-    """Flatten a metrics dict (as saved by evaluate_predictions.evaluate()) into
-    one row per tier + overall, for a combined comparison table."""
     rows = []
     blocks = {"OVERALL": metrics["overall"]}
     blocks.update(metrics.get("by_tier", {}))
@@ -104,14 +114,13 @@ def metrics_rows(label, metrics):
 
 def render_markdown(df, tier_order):
     lines = ["# Worst-tier interaction feature ablation results\n"]
-    lines.append("baseline_worst_tier_off = pre-change behavior "
-                  "(--disable-worst-tier-features). "
-                  "new_worst_tier_on = with the 6 new interaction features "
-                  "(default, no flag needed).\n")
-    lines.append("Watch the $2.5K-4K / $4K-6K / $6K-10K rows — that's the "
-                  "band these features specifically target. A regression in "
-                  "$0-200/$200-500/$500-1K would mean the interactions are "
-                  "adding noise elsewhere; check those too.\n")
+    lines.append(f"`{BASELINE_NAME}` = --enable-worst-tier-features none (pre-change behavior). "
+                  "Each other group enables exactly ONE of the 6 new interaction features "
+                  "against that same baseline (not cumulative).\n")
+    lines.append("**Most vehicle volume sits in $0-200/$200-500/$500-1K/$1K-2.5K** -- check "
+                  "those rows first. $0-500 is currently *overpredicted* (positive bias); "
+                  "$1K-2.5K is *underpredicted* (negative bias). The $2.5K+ rows are kept "
+                  "for reference (that tier has the worst per-row MAE) but are secondary here.\n")
     headers = ["group"] + [label for _, label, _ in METRIC_KEYS]
     for tier in tier_order:
         sub = df[df["tier"] == tier]
@@ -142,28 +151,36 @@ def main():
                              "(default off, matching train_save_script21.py's default).")
     parser.add_argument("--enable-new-features", default="",
                         help="Forward --enable-new-features to every training subprocess "
-                             "(default: none — keeps the true_mileage_unknown/clean_title/"
-                             "gvm_range/tonnage/engine_type set at its own baseline so this "
-                             "run isolates the worst-tier interactions only).")
+                             "(default: none), so this run isolates the worst-tier "
+                             "interactions only.")
+    parser.add_argument("--include-all-combined", action="store_true",
+                        help="Add a 7th group testing all 6 features together "
+                             "(--enable-worst-tier-features all), on top of the "
+                             "baseline + one-at-a-time groups.")
     parser.add_argument("--only", default=None,
                         help="Comma-separated subset of group names to run "
-                             "(default: both baseline_worst_tier_off and new_worst_tier_on)")
+                             f"(choose from: baseline, {', '.join(WORST_TIER_FEATURE_COLS)}"
+                             + (", all_combined" if True else "") +
+                             "). Default: baseline + all 6 individually.")
     args = parser.parse_args()
 
-    groups_to_run = GROUPS
+    groups_to_run = build_groups(args.include_all_combined)
     if args.only:
         wanted = set(args.only.split(","))
-        groups_to_run = [g for g in GROUPS if g[0] in wanted]
+        groups_to_run = [g for g in groups_to_run if g[0] in wanted]
+        if not groups_to_run:
+            parser.error(f"--only matched no groups; choose from "
+                         f"{[g[0] for g in build_groups(True)]}")
 
     all_rows = []
-    for name, disable_flag in groups_to_run:
-        metrics = run_group(name, disable_flag, args)
+    for name, enable_value in groups_to_run:
+        metrics = run_group(name, enable_value, args)
         if metrics is None:
             continue
         all_rows.extend(metrics_rows(name, metrics))
 
     df = pd.DataFrame(all_rows)
-    tier_order = ["OVERALL"] + TIER_LABELS
+    tier_order = ["OVERALL"] + PRIORITY_TIERS + [t for t in TIER_LABELS if t not in PRIORITY_TIERS]
     df["tier"] = pd.Categorical(df["tier"], categories=tier_order, ordered=True)
     df = df.sort_values(["tier", "group"])
 

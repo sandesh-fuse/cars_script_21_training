@@ -110,6 +110,29 @@ DEFAULT_PARAMS_STANDARD = {
 XGB_KWARGS_GLOBAL = {'tree_method': 'hist'}
 
 
+def resolve_worst_tier_features(raw):
+    """Parse --enable-worst-tier-features into what
+    SaleValuePreprocessor(enable_worst_tier_features=...) expects: True
+    (all 6 on), False (all off), or a list of specific column names (test
+    one -- or a few -- at a time). Mirrors --enable-new-features's
+    comma-separated-list convention, plus 'all'/'none' shorthands since
+    "all 6 on" is the default (unlike --enable-new-features, whose default
+    is "none").
+    """
+    val = raw.strip().lower()
+    if val in ("all", ""):
+        return True
+    if val == "none":
+        return False
+    names = [c.strip() for c in raw.split(",") if c.strip()]
+    unknown = set(names) - set(WORST_TIER_FEATURE_COLS)
+    if unknown:
+        raise ValueError(
+            f"--enable-worst-tier-features: unrecognized column(s) {sorted(unknown)}; "
+            f"choose from {WORST_TIER_FEATURE_COLS}, or 'all'/'none'")
+    return names
+
+
 # ============================================================
 # METRICS
 # ============================================================
@@ -214,7 +237,7 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         with_target_encoding=False,
         zip_lat_map=zip_lat_map, zip_lon_map=zip_lon_map, cult_lookup=cult_lookup,
         extra_drop_cols=new_features_drop_cols + dataone_drop_cols,
-        enable_worst_tier_features=not args.disable_worst_tier_features,
+        enable_worst_tier_features=resolve_worst_tier_features(args.enable_worst_tier_features),
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -327,12 +350,14 @@ def main():
                         help="Include DataOne-sourced vehicle spec features "
                              f"({', '.join(DATAONE_FEATURES)}) in training. "
                              "Default: false (these features are excluded).")
-    parser.add_argument("--disable-worst-tier-features", action='store_true',
-                        help="Disable the $2.5K-10K worst-dollar-error-tier "
-                             f"interaction features ({', '.join(WORST_TIER_FEATURE_COLS)}). "
-                             "Default: false (enabled) — pass this flag to reproduce "
-                             "the pre-worst-tier-interactions baseline for ablation "
-                             "comparisons. See worst_case_analysis_2500_10000/.")
+    parser.add_argument("--enable-worst-tier-features", default="all",
+                        help="Which worst-dollar-error-tier interaction features to "
+                             f"include, comma-separated subset of {{{','.join(WORST_TIER_FEATURE_COLS)}}}, "
+                             "or 'all' (default) / 'none'. Use a single name to "
+                             "ablation-test that one feature in isolation, e.g. "
+                             "--enable-worst-tier-features unknowns_x_mileage_bkt. "
+                             "'none' reproduces the pre-worst-tier-interactions baseline. "
+                             "See worst_case_analysis_2500_10000/.")
     args = parser.parse_args()
 
     if not (0 < args.cap_pct <= 100):
@@ -347,6 +372,12 @@ def main():
                      f"choose from {NEW_FEATURE_COLS}")
     new_features_drop_cols = [c for c in NEW_FEATURE_COLS if c not in enabled_new_features]
     print(f">>> New features enabled: {enabled_new_features or '(none — 2406a7a baseline)'}")
+
+    try:
+        worst_tier_features_resolved = resolve_worst_tier_features(args.enable_worst_tier_features)
+    except ValueError as e:
+        parser.error(str(e))
+    print(f">>> Worst-tier interaction features enabled: {worst_tier_features_resolved}")
 
     if args.use_dataone:
         print(">>> DataOne features ENABLED (--use-dataone): "
@@ -811,7 +842,7 @@ def main():
             'min_salevalue': args.min_salevalue,
             'enabled_new_features': enabled_new_features,
             'new_features_excluded': new_features_drop_cols,
-            'worst_tier_features_enabled': not args.disable_worst_tier_features,
+            'worst_tier_features_enabled': worst_tier_features_resolved,
             'use_dataone': bool(args.use_dataone),
             'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
             'save_shap_used': bool(args.save_shap),

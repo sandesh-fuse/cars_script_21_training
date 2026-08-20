@@ -405,9 +405,11 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         self.use_macro = use_macro
         self.use_geo   = use_geo
         self.use_cult  = use_cult
-        # See WORST_TIER_FEATURE_COLS. Default True (on) — these are new,
-        # not part of the 2406a7a baseline; set False to reproduce the
-        # baseline for ablation comparisons.
+        # See WORST_TIER_FEATURE_COLS. Accepts True (all 6 on, default),
+        # False (all off — reproduces the pre-worst-tier baseline), or an
+        # iterable of specific column names to enable individually (e.g.
+        # {'unknowns_x_mileage_bkt'}) so each can be ablation-tested one at
+        # a time. See _wtf().
         self.enable_worst_tier_features = enable_worst_tier_features
         self.with_target_encoding = with_target_encoding
         self.smoothing = smoothing
@@ -428,6 +430,16 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # from price data, but with the cluster as an extra grouping signal.
         self.n_clusters = n_clusters
         self.cluster_min_samples = cluster_min_samples
+
+    def _wtf(self, name):
+        """Whether one WORST_TIER_FEATURE_COLS column is enabled. Handles
+        all three forms enable_worst_tier_features can take: True (all on),
+        False (all off), or an iterable of specific names to enable one at
+        a time (see --enable-worst-tier-features in train_save_script21.py)."""
+        v = self.enable_worst_tier_features
+        if isinstance(v, bool):
+            return v
+        return name in v
 
     def _normalize_text(self, X):
         for col in X.select_dtypes(include='object').columns:
@@ -808,11 +820,11 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # Numeric x numeric/bucket interactions, matching the cult_x_age /
         # mileage_unknown_x_age pattern (plain multiplication, trees handle
         # the rest).
-        if self.enable_worst_tier_features and {'n_unknowns','mileage_bucket'}.issubset(X.columns):
+        if self._wtf('unknowns_x_mileage_bkt') and {'n_unknowns','mileage_bucket'}.issubset(X.columns):
             X['unknowns_x_mileage_bkt'] = X['n_unknowns'] * X['mileage_bucket']
-        if self.enable_worst_tier_features and {'n_unknowns','age_bucket'}.issubset(X.columns):
+        if self._wtf('unknowns_x_age_bkt') and {'n_unknowns','age_bucket'}.issubset(X.columns):
             X['unknowns_x_age_bkt'] = X['n_unknowns'] * X['age_bucket']
-        if self.enable_worst_tier_features and {'mechanical_severity_mean','mileage_bucket'}.issubset(X.columns):
+        if self._wtf('mech_severity_x_mileage_bkt') and {'mechanical_severity_mean','mileage_bucket'}.issubset(X.columns):
             X['mech_severity_x_mileage_bkt'] = (
                 X['mechanical_severity_mean'].fillna(-1) * X['mileage_bucket']
             )
@@ -858,7 +870,7 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                 X['culttier_x_age'] = X['cult_tier_num'].fillna(0) * X['age'].fillna(-1)
             if 'cult_origsens_num' in X.columns and 'runs_flag' in X.columns:
                 X['origsens_x_runs'] = X['cult_origsens_num'].fillna(-1) * X['runs_flag']
-            if self.enable_worst_tier_features and 'n_unknowns' in X.columns:
+            if self._wtf('cult_x_n_unknowns') and 'n_unknowns' in X.columns:
                 # Cult route shows its own elevated MAE (by_route breakdown);
                 # missing condition data plausibly discounts value less on a
                 # cult car (make/model desirability dominates) than on a
@@ -880,7 +892,7 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['zip_region_x_mileage_bkt'] = cc(X['zip_region'], X['mileage_bucket'].astype(str))
         if {'quarter','make'}.issubset(X.columns):
             X['quarter_x_make'] = cc(X['quarter'].astype(str), X['make'])
-        if self.enable_worst_tier_features and {'vehicle_type','mileage_bucket'}.issubset(X.columns):
+        if self._wtf('vtype_x_mileage_bkt') and {'vehicle_type','mileage_bucket'}.issubset(X.columns):
             # vehicle_type is already combined with make/nav_condition/zip
             # region but never with mileage — trucks/vans/SUVs plausibly
             # hold value on a different mileage curve than sedans, which is
@@ -949,7 +961,7 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['mileage_unknown_x_make'] = cc(
                 X['true_mileage_unknown'].fillna(-1).astype(str), X['make']
             )
-        if self.enable_worst_tier_features and {'true_mileage_unknown', 'n_unknowns'}.issubset(X.columns):
+        if self._wtf('mileage_unknown_x_n_unknowns') and {'true_mileage_unknown', 'n_unknowns'}.issubset(X.columns):
             # Compounding data-quality signal: true_mileage_unknown and
             # condition-unknown count move together in the $2.5K-10K worst-
             # underpredicted rows (both show ~+22pp lift there) but were
