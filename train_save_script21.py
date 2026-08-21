@@ -34,9 +34,10 @@ from xgboost import XGBRegressor
 
 from preprocessor import (
     SaleValuePreprocessor, MONO_FEATURES, NEW_FEATURE_COLS, WORST_TIER_FEATURE_COLS,
-    CONDITION_MAKE_FEATURE_COLS,
+    CONDITION_MAKE_FEATURE_COLS, VENDOR_FEATURE_COLS,
     TARGET_COL, TIME_COL,
     build_cult_lookup, build_zip_lookup, compute_cult_flag,
+    build_vendor_zip_lookup,
     cpi_ratio_arr, adjust_target, deflate_pred,
 )
 from schema_adapter import map_raw_features_to_legacy, filter_to_known_columns
@@ -145,6 +146,12 @@ def resolve_condition_make_features(raw):
     return _resolve_feature_toggle(raw, CONDITION_MAKE_FEATURE_COLS, "--enable-condition-make-features")
 
 
+def resolve_vendor_features(raw):
+    """Parse --enable-vendor-features into what
+    SaleValuePreprocessor(enable_vendor_features=...) expects."""
+    return _resolve_feature_toggle(raw, VENDOR_FEATURE_COLS, "--enable-vendor-features")
+
+
 # ============================================================
 # METRICS
 # ============================================================
@@ -238,7 +245,8 @@ def tune_quantile(name, X_tr, y_tr_adj, X_va, y_va_adj, monotone, quantile_alpha
 # TRAIN A SUBSET MODEL (CULT or STANDARD) WITH 3 QUANTILES
 # ============================================================
 def train_subset_with_quantiles(name, config, default_params, train_subset, test_subset,
-                                  zip_lat_map, zip_lon_map, cult_lookup, args):
+                                  zip_lat_map, zip_lon_map, cult_lookup, args,
+                                  vendor_zip_lookup=None, vendor_global_mean=None):
     print(f"\n[{name}] Preprocessing (train_n={len(train_subset):,}, test_n={len(test_subset):,})...")
     enabled_new_features = [c.strip() for c in args.enable_new_features.split(",") if c.strip()]
     new_features_drop_cols = [c for c in NEW_FEATURE_COLS if c not in enabled_new_features]
@@ -251,6 +259,8 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         extra_drop_cols=new_features_drop_cols + dataone_drop_cols,
         enable_worst_tier_features=resolve_worst_tier_features(args.enable_worst_tier_features),
         enable_condition_make_features=resolve_condition_make_features(args.enable_condition_make_features),
+        vendor_zip_lookup=vendor_zip_lookup, vendor_global_mean=vendor_global_mean,
+        enable_vendor_features=resolve_vendor_features(args.enable_vendor_features),
     )
 
     R_train = cpi_ratio_arr(train_subset)
@@ -379,6 +389,15 @@ def main():
                              "in isolation, e.g. --enable-condition-make-features runs_x_make. "
                              "'none' reproduces the pre-condition-make-interactions baseline. "
                              "See worst_case_analysis_100_2000/.")
+    parser.add_argument("--enable-vendor-features", default="all",
+                        help="Which vendor-region-effect features to include (ported from "
+                             f"main's commit 2de22bd), comma-separated subset of "
+                             f"{{{','.join(VENDOR_FEATURE_COLS)}}}, or 'all' (default) / 'none'. "
+                             "Use a single name to ablation-test that one feature in isolation, "
+                             "e.g. --enable-vendor-features vendor_region_effect. 'none' "
+                             "reproduces the pre-vendor-feature baseline. Requires a 'vendor_id' "
+                             "column in the raw --data CSV; silently no-ops (empty lookup) if "
+                             "absent regardless of this flag.")
     args = parser.parse_args()
 
     if not (0 < args.cap_pct <= 100):
@@ -406,6 +425,12 @@ def main():
         parser.error(str(e))
     print(f">>> Condition-x-make interaction features enabled: {condition_make_features_resolved}")
 
+    try:
+        vendor_features_resolved = resolve_vendor_features(args.enable_vendor_features)
+    except ValueError as e:
+        parser.error(str(e))
+    print(f">>> Vendor-region-effect features enabled: {vendor_features_resolved}")
+
     if args.use_dataone:
         print(">>> DataOne features ENABLED (--use-dataone): "
               f"{DATAONE_FEATURES} will be used for training")
@@ -428,11 +453,22 @@ def main():
     print(f"\nLoading training data from {args.data}...")
     df = pd.read_csv(args.data, low_memory=False)
 
+    # Capture vendor_id BEFORE schema filtering drops it (it's not a
+    # recognized column -- never a PredictRequest field, never in
+    # schema_adapter's map -- by design, since it must never be expected at
+    # inference). Used ONLY to fit a training-time-only, zip-keyed vendor
+    # effect lookup below; re-attached to df temporarily so it survives the
+    # same row filters as everything else, then dropped again before any
+    # SaleValuePreprocessor ever sees it.
+    _vendor_id_raw = df['vendor_id'].copy() if 'vendor_id' in df.columns else None
+
     print("Dropping columns not recognized by the schema adapter (DB noise/metadata)...")
     df = filter_to_known_columns(df)
 
     print("Mapping new database schema to legacy ML schema...")
     df = map_raw_features_to_legacy(df)
+    if _vendor_id_raw is not None:
+        df['_vendor_id_for_lookup'] = _vendor_id_raw.reindex(df.index)
 
     #df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors='coerce')
     df[TIME_COL] = pd.to_datetime(df[TIME_COL], format='mixed', errors='coerce')
@@ -489,6 +525,21 @@ def main():
     test_raw  = df[df[TIME_COL] >= test_cutoff].copy().reset_index(drop=True)
     print(f"Train: {len(train_raw):,}  Test: {len(test_raw):,}")
 
+    # Build the vendor-region effect lookup from TRAIN ONLY (never test).
+    # vendor_id is used HERE AND ONLY HERE; the column is dropped immediately
+    # after so it can never reach SaleValuePreprocessor.fit()/.transform() or
+    # become a model feature, and never appears in a PredictRequest.
+    if '_vendor_id_for_lookup' in train_raw.columns:
+        print("Building vendor-region effect lookup (train-only; vendor_id discarded right after)...")
+        VENDOR_ZIP_LOOKUP, VENDOR_GLOBAL_MEAN = build_vendor_zip_lookup(
+            train_raw.rename(columns={'_vendor_id_for_lookup': 'vendor_id'}))
+        print(f"  {len(VENDOR_ZIP_LOOKUP):,} zip-region vendor-effect entries built.")
+        train_raw = train_raw.drop(columns=['_vendor_id_for_lookup'])
+        test_raw  = test_raw.drop(columns=['_vendor_id_for_lookup'], errors='ignore')
+    else:
+        VENDOR_ZIP_LOOKUP, VENDOR_GLOBAL_MEAN = {}, None
+        print("Vendor-region effect lookup: skipped (vendor_id not present in source data).")
+
     # Partition
     train_cult_flag = compute_cult_flag(train_raw, CULT_LOOKUP)
     test_cult_flag  = compute_cult_flag(test_raw,  CULT_LOOKUP)
@@ -504,14 +555,16 @@ def main():
     pre_cult, models_cult, preds_cult, params_cult = train_subset_with_quantiles(
         "CULT", CULT_CONFIG, DEFAULT_PARAMS_CULT,
         train_cult_raw, test_cult_raw,
-        LAT_MAP, LON_MAP, CULT_LOOKUP, args)
+        LAT_MAP, LON_MAP, CULT_LOOKUP, args,
+        vendor_zip_lookup=VENDOR_ZIP_LOOKUP, vendor_global_mean=VENDOR_GLOBAL_MEAN)
 
     # Train standard quantiles
     print("\n" + "#" * 70 + "\n# STANDARD MODEL (3 quantiles)\n" + "#" * 70)
     pre_std, models_std, preds_std, params_std = train_subset_with_quantiles(
         "STANDARD", STANDARD_CONFIG, DEFAULT_PARAMS_STANDARD,
         train_std_raw, test_std_raw,
-        LAT_MAP, LON_MAP, CULT_LOOKUP, args)
+        LAT_MAP, LON_MAP, CULT_LOOKUP, args,
+        vendor_zip_lookup=VENDOR_ZIP_LOOKUP, vendor_global_mean=VENDOR_GLOBAL_MEAN)
 
     # Routed predictions
     y_test = test_raw[TARGET_COL].values
@@ -589,6 +642,12 @@ def main():
     joblib.dump(CULT_LOOKUP, os.path.join(args.out, "cult_lookup.joblib"))
     joblib.dump(LAT_MAP, os.path.join(args.out, "zip_lat_map.joblib"))
     joblib.dump(LON_MAP, os.path.join(args.out, "zip_lon_map.joblib"))
+    # {zip_prefix: effect} only -- no vendor_id anywhere in this artifact.
+    # Also embedded in preprocessor_{cult,standard}.joblib already (loaded
+    # by app/inference_script21.py as part of those fitted objects, so no
+    # inference-side wiring is needed); saved standalone too for inspection,
+    # matching the cult_lookup/zip_map convention.
+    joblib.dump(VENDOR_ZIP_LOOKUP, os.path.join(args.out, "vendor_zip_lookup.joblib"))
     with open(os.path.join(args.out, "alphas.json"), 'w') as f:
         json.dump({
             'cult_alpha': CULT_CONFIG['alpha'],
@@ -871,6 +930,9 @@ def main():
             'new_features_excluded': new_features_drop_cols,
             'worst_tier_features_enabled': worst_tier_features_resolved,
             'condition_make_features_enabled': condition_make_features_resolved,
+            'vendor_features_enabled': vendor_features_resolved,
+            'vendor_zip_lookup_size': len(VENDOR_ZIP_LOOKUP),
+            'vendor_global_mean': VENDOR_GLOBAL_MEAN,
             'use_dataone': bool(args.use_dataone),
             'dataone_features_excluded': [] if args.use_dataone else DATAONE_FEATURES,
             'save_shap_used': bool(args.save_shap),

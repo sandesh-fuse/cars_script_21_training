@@ -66,6 +66,16 @@ CONDITION_MAKE_FEATURE_COLS = [
     'runs_x_make', 'mech_severity_x_make', 'all_cond_combo_x_make',
 ]
 
+# Vendor-region effect features (ported from main's commit 2de22bd -- see
+# build_vendor_zip_lookup() above). 'vendor_region_effect' itself is the
+# base feature (a zip-region-level proxy for vendor pricing effect,
+# vendor_id never touches inference); the other two are its interactions
+# with age/mileage. Gated the same True/False/name-list way as the other
+# two lists above (see _vf()).
+VENDOR_FEATURE_COLS = [
+    'vendor_region_effect', 'vendor_region_effect_x_age', 'vendor_region_effect_x_mileage_bucket',
+]
+
 # ============================================================
 # MACRO DATA
 # ============================================================
@@ -203,6 +213,50 @@ def build_zip_lookup(zip_series):
     out = nomi.query_postal_code(uniq)
     out = out[['postal_code','latitude','longitude']].set_index('postal_code')
     return out['latitude'].to_dict(), out['longitude'].to_dict()
+
+# ============================================================
+# VENDOR-REGION EFFECT LOOKUP
+# ============================================================
+# vendor_id is NEVER available at inference (it's assigned by post-intake
+# routing/logistics, after the point a prediction would be made). This
+# lookup makes vendor's historical price effect usable anyway by keying the
+# FINAL, served feature on zip code (always available) instead of vendor
+# identity. vendor_id is touched ONLY here, ONCE, on historical training
+# data -- never inside SaleValuePreprocessor.transform(), never at
+# inference, never in app/schemas.py's PredictRequest.
+#
+# Two-stage: (1) genuine vendor-level target encoding of salevalue (needs
+# vendor_id -- this is the only step that does), (2) average that effect
+# across whichever vendor(s) historically served each 3-digit zip prefix,
+# producing a plain {zip_prefix: effect} dict with no vendor identity left
+# in it. At inference, only the requester's zip is used to look this up.
+# Ported from main's commit 2de22bd (vendor-lookup piece only -- that
+# commit also switched to OOF target encoding and added unrelated
+# DataOne/registration-mismatch features, none of which are pulled in here).
+def build_vendor_zip_lookup(train_df, vendor_col='vendor_id',
+                              zip_col='vazipcode', smoothing=20):
+    if vendor_col not in train_df.columns or zip_col not in train_df.columns:
+        return {}, None
+
+    global_mean = float(train_df[TARGET_COL].mean())
+
+    # Stage 1: smoothed vendor-level target encoding (uses vendor_id + salevalue)
+    vendor_agg = train_df.groupby(vendor_col)[TARGET_COL].agg(['mean', 'count'])
+    vendor_smoothed = ((vendor_agg['count'] * vendor_agg['mean'] + smoothing * global_mean)
+                        / (vendor_agg['count'] + smoothing))
+
+    # Stage 2: back off from vendor identity to zip region (uses vendor_id + zip,
+    # never zip + salevalue directly -- the effect being averaged already came
+    # from Stage 1's vendor-level encoding, not a raw regional price average).
+    z = (train_df[zip_col].astype(str)
+                          .str.extract(r'(\d{1,5})')[0].str.zfill(5))
+    zip_region = z.str[:3]
+    vendor_effect_per_row = train_df[vendor_col].map(vendor_smoothed)
+    region_effect = (pd.DataFrame({'zip_region': zip_region, 'effect': vendor_effect_per_row})
+                        .dropna()
+                        .groupby('zip_region')['effect']
+                        .mean())
+    return region_effect.to_dict(), global_mean
 
 # ============================================================
 # SEVERITY MAPS
@@ -414,7 +468,9 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                  zip_lat_map=None, zip_lon_map=None, cult_lookup=None,
                  n_clusters=12, cluster_min_samples=50,
                  extra_drop_cols=None, enable_worst_tier_features=True,
-                 enable_condition_make_features=True):
+                 enable_condition_make_features=True,
+                 vendor_zip_lookup=None, vendor_global_mean=None,
+                 enable_vendor_features=True):
         self.time_col = time_col
         self.seed     = seed
         self.use_macro = use_macro
@@ -429,6 +485,15 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         # See CONDITION_MAKE_FEATURE_COLS. Same True/False/iterable
         # convention as enable_worst_tier_features above. See _cmf().
         self.enable_condition_make_features = enable_condition_make_features
+        # Fitted {zip_prefix: historical vendor effect} dict from
+        # build_vendor_zip_lookup(). vendor_id itself is never stored here or
+        # anywhere downstream -- only this already-aggregated, zip-keyed
+        # lookup, which is all _add_vendor_features() ever touches.
+        self.vendor_zip_lookup = vendor_zip_lookup or {}
+        self.vendor_global_mean = vendor_global_mean
+        # See VENDOR_FEATURE_COLS. Same True/False/iterable convention as
+        # the two toggles above. See _vf().
+        self.enable_vendor_features = enable_vendor_features
         self.with_target_encoding = with_target_encoding
         self.smoothing = smoothing
         self.n_folds   = n_folds
@@ -464,6 +529,15 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         enable_condition_make_features (see --enable-condition-make-features
         in train_save_script21.py)."""
         v = self.enable_condition_make_features
+        if isinstance(v, bool):
+            return v
+        return name in v
+
+    def _vf(self, name):
+        """Same as _wtf()/_cmf() but for VENDOR_FEATURE_COLS /
+        enable_vendor_features (see --enable-vendor-features in
+        train_save_script21.py)."""
+        v = self.enable_vendor_features
         if isinstance(v, bool):
             return v
         return name in v
@@ -698,6 +772,28 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         X['cult_uplift_range'] = (X['cult_uplift_high'] - X['cult_uplift_low'])
         return X
 
+    def _add_vendor_features(self, X):
+        """Apply the fitted vendor-region lookup using ONLY zip code.
+
+        vendor_id is never read here or anywhere in this class -- only the
+        already-aggregated {zip_prefix: effect} dict built once by
+        build_vendor_zip_lookup() during training. Safe to call at inference
+        with just the request's vazipcode.
+
+        Always computed (unconditional on _vf('vendor_region_effect')) so
+        the two interactions in _engineer() can use it even when someone
+        ablation-tests an interaction alone without the base feature
+        enabled -- _engineer() drops the raw column again at the end if
+        the base feature itself was disabled. See VENDOR_FEATURE_COLS.
+        """
+        if not self.vendor_zip_lookup or 'vazipcode' not in X.columns:
+            return X
+        z = X['vazipcode'].astype(str).str.extract(r'(\d{1,5})')[0].str.zfill(5)
+        zip_region = z.str[:3]
+        default = self.vendor_global_mean if self.vendor_global_mean is not None else 0.0
+        X['vendor_region_effect'] = zip_region.map(self.vendor_zip_lookup).fillna(default)
+        return X
+
     def _basic_clean(self, X):
         # Step 1: coalesce paired (nav_*, primary) columns. Prefer nav_*, fall
         # back to the primary field. The unified value lives in the primary
@@ -740,6 +836,7 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                 X[col] = self._coerce_bool_flag(X[col])
 
         X = self._normalize_text(X)
+        X = self._add_vendor_features(X)
         if self.use_cult:
             X = self._add_cult_features(X)
         if 'mileage' in X.columns:
@@ -888,6 +985,18 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                 X['lat_x_age'] = X['zip_lat'] * X['age']
             if {'zip_lon','age'}.issubset(X.columns):
                 X['lon_x_age'] = X['zip_lon'] * X['age']
+        # Vendor-region effect interactions (see _add_vendor_features/
+        # build_vendor_zip_lookup -- zip-keyed proxy, never uses vendor_id
+        # at inference). See VENDOR_FEATURE_COLS / _vf().
+        if 'vendor_region_effect' in X.columns:
+            if self._vf('vendor_region_effect_x_age') and 'age' in X.columns:
+                X['vendor_region_effect_x_age'] = (
+                    X['vendor_region_effect'].fillna(0) * X['age'].fillna(-1)
+                )
+            if self._vf('vendor_region_effect_x_mileage_bucket') and 'mileage_bucket' in X.columns:
+                X['vendor_region_effect_x_mileage_bucket'] = (
+                    X['vendor_region_effect'].fillna(0) * X['mileage_bucket']
+                )
         if self.use_cult and 'is_cult' in X.columns:
             if 'age' in X.columns:
                 X['cult_x_age'] = X['is_cult'] * X['age'].fillna(-1)
@@ -1029,6 +1138,15 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             X['clean_title_x_mileage_bucket'] = (
                 X['clean_title'].fillna(0) * X['mileage_bucket']
             )
+
+        # vendor_region_effect was computed unconditionally in
+        # _add_vendor_features (above, in _basic_clean) so the two
+        # interactions could use it even when ablation-testing just one
+        # interaction without the base feature. Drop the raw column now,
+        # after both interactions have had their chance to read it, if the
+        # base feature itself wasn't actually requested.
+        if 'vendor_region_effect' in X.columns and not self._vf('vendor_region_effect'):
+            X = X.drop(columns=['vendor_region_effect'])
         return X
 
     # =================================================================
@@ -1286,6 +1404,7 @@ MONO_FEATURES = {
     'is_cult': +1, 'cult_tier_num': +1, 'cult_enthusiast_score': +1,
     'cult_uplift_mid': +1, 'cult_uplift_high': +1, 'cult_last_of_kind': +1,
     'true_mileage_unknown': -1, 'clean_title': +1,
+    'vendor_region_effect': +1,
 }
 
 
