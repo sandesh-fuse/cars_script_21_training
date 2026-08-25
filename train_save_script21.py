@@ -173,6 +173,19 @@ def pinball_loss(y_true, y_pred, alpha):
     diff = y_true - y_pred
     return float(np.mean(np.maximum(alpha * diff, (alpha - 1) * diff)))
 
+def monthly_metrics_rows(label, metrics):
+    """Flatten evaluate_predictions.evaluate()'s `by_month` breakdown into
+    one row per month (full fidelity -- every key in the block, not a
+    whitelist) for saving as a CSV artifact."""
+    rows = []
+    for month, m in metrics.get('by_month', {}).items():
+        if m['N'] == 0:
+            continue
+        row = {'label': label, 'month': month}
+        row.update(m)
+        rows.append(row)
+    return rows
+
 
 # ============================================================
 # GPU PROBE
@@ -266,10 +279,39 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
     R_train = cpi_ratio_arr(train_subset)
     y_train = train_subset[TARGET_COL].values
 
+    # Raw columns actually available to the preprocessor for this route,
+    # captured before fit() so it reflects the input as-is (see feature_audit
+    # below for what "used" vs "sent to model" means).
+    raw_columns_available = list(train_subset.columns)
+
     X_train = pre.fit(train_subset).transform(train_subset)
     X_test  = pre.transform(test_subset.drop(columns=[TARGET_COL], errors='ignore'))
 
     monotone = tuple(MONO_FEATURES.get(c, 0) for c in pre.feature_cols_)
+
+    # Feature audit: SaleValuePreprocessor is drop-list-based, not allow-list
+    # based (see preprocessor.py _basic_clean's `all_drops` line) -- anything
+    # not explicitly hard-dropped up front automatically becomes a feature,
+    # including columns read to derive something (e.g. other_damages,
+    # record_creation_date, vazipcode, nav_make/nav_model/nav_year) before
+    # being dropped again downstream. There's no hand-maintained "columns
+    # used" list to read off, so this is computed the same way the
+    # preprocessor itself decides what to drop: raw_columns_used =
+    # everything available MINUS the exact hard-drop set for this route.
+    # Known limitation: this proves "not hard-dropped up front," not
+    # "definitely read by some line of code" -- a column absent from every
+    # drop list but never actually referenced anywhere would still show up
+    # as "used" here.
+    route_drop_cols = pre.DROP_COLS_NO_ZIP if pre.use_geo else pre.DROP_COLS_WITH_ZIP_DROP
+    hard_dropped = set(pre.USER_DROP_COLS) | set(route_drop_cols) | set(pre.extra_drop_cols)
+    raw_columns_dropped_unused = sorted(set(raw_columns_available) & hard_dropped)
+    raw_columns_used = sorted(set(raw_columns_available) - hard_dropped)
+    feature_audit = {
+        'raw_columns_available': raw_columns_available,
+        'raw_columns_dropped_unused': raw_columns_dropped_unused,
+        'raw_columns_used': raw_columns_used,
+        'model_features': list(pre.feature_cols_),
+    }
     y_train_adj = adjust_target(y_train, R_train, config['alpha'])
 
     n_es = int(len(X_train) * 0.9)
@@ -312,7 +354,7 @@ def train_subset_with_quantiles(name, config, default_params, train_subset, test
         print(f"  [{name}-{qlab}] best_iter={model.best_iteration}  "
               f"({(time.time()-t0)/60:.1f} min)")
 
-    return pre, models, preds_test, best_params_by_q
+    return pre, models, preds_test, best_params_by_q, feature_audit
 
 
 # ============================================================
@@ -552,7 +594,7 @@ def main():
 
     # Train cult quantiles
     print("\n" + "#" * 70 + "\n# CULT MODEL (3 quantiles)\n" + "#" * 70)
-    pre_cult, models_cult, preds_cult, params_cult = train_subset_with_quantiles(
+    pre_cult, models_cult, preds_cult, params_cult, audit_cult = train_subset_with_quantiles(
         "CULT", CULT_CONFIG, DEFAULT_PARAMS_CULT,
         train_cult_raw, test_cult_raw,
         LAT_MAP, LON_MAP, CULT_LOOKUP, args,
@@ -560,7 +602,7 @@ def main():
 
     # Train standard quantiles
     print("\n" + "#" * 70 + "\n# STANDARD MODEL (3 quantiles)\n" + "#" * 70)
-    pre_std, models_std, preds_std, params_std = train_subset_with_quantiles(
+    pre_std, models_std, preds_std, params_std, audit_std = train_subset_with_quantiles(
         "STANDARD", STANDARD_CONFIG, DEFAULT_PARAMS_STANDARD,
         train_std_raw, test_std_raw,
         LAT_MAP, LON_MAP, CULT_LOOKUP, args,
@@ -660,6 +702,13 @@ def main():
             'standard_use_cult':  STANDARD_CONFIG['use_cult'],
         }, f, indent=2)
 
+    # Raw columns used (even if dropped again after deriving a feature) vs.
+    # the exact encoded columns sent to the model -- two different things,
+    # kept in their own file rather than folded into training_metadata.json.
+    # See feature_audit / raw_columns_used in train_subset_with_quantiles().
+    with open(os.path.join(args.out, "feature_columns.json"), 'w') as f:
+        json.dump({"cult": audit_cult, "standard": audit_std}, f, indent=2)
+
     # ----- Save FULL train and test predictions for analysis -----
     print(f"\n--- Computing train predictions (full set) for save ---")
     # Predict on each train subset with its own preprocessor and routed quantile models,
@@ -711,11 +760,20 @@ def main():
     # Reminder: train predictions are produced by a model that saw those rows during
     # training; they will look better than test. Use for sanity checks, not evaluation.
 
-    # Evaluate and save per-tier metrics JSON for each (also breaks down by route)
-    evaluate(train_pred_df, label="script21_train",
+    # Evaluate and save per-tier metrics JSON for each (also breaks down by
+    # route and by month -- see evaluate_predictions.evaluate()'s MAPE_p50 /
+    # by_month additions).
+    train_metrics = evaluate(train_pred_df, label="script21_train",
              save_json_to=os.path.join(args.out, "train_metrics.json"), verbose=True)
-    evaluate(test_pred_df,  label="script21_test",
+    test_metrics = evaluate(test_pred_df,  label="script21_test",
              save_json_to=os.path.join(args.out, "test_metrics.json"),  verbose=True)
+
+    # Month-wise metrics CSV (MAE/RMSLE/MAPE/coverage/etc per calendar month),
+    # flattened from the by_month breakdown above.
+    pd.DataFrame(monthly_metrics_rows("script21_train", train_metrics)).to_csv(
+        os.path.join(args.out, "monthly_metrics_train.csv"), index=False)
+    pd.DataFrame(monthly_metrics_rows("script21_test", test_metrics)).to_csv(
+        os.path.join(args.out, "monthly_metrics_test.csv"), index=False)
 
     # ----- Optional SHAP exports -----
     want_per_row = args.save_shap

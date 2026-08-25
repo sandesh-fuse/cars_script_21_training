@@ -34,6 +34,11 @@ TIER_EDGES  = [0, 200, 500, 1000, 2500, 4000, 6000, 10000, 15000, 25000, np.inf]
 TIER_LABELS = ['$0-200', '$200-500', '$500-1K', '$1K-2.5K', '$2.5K-4K',
                '$4K-6K',  '$6K-10K',  '$10K-15K', '$15K-25K', '$25K+']
 
+# Column evaluate() groups rows by for the by_month breakdown (see evaluate()).
+# Matches preprocessor.TIME_COL's value -- not imported directly to keep this
+# module decoupled from preprocessor.py/train_save_script21.py.
+DATE_COL = 'record_creation_date'
+
 
 # ---------- Metrics ----------
 def mae(y, p):  return float(np.mean(np.abs(y - p)))
@@ -41,6 +46,22 @@ def rmse(y, p): return float(np.sqrt(np.mean((y - p) ** 2)))
 def rmsle(y, p):
     p = np.clip(p, 1, None)
     return float(np.sqrt(np.mean((np.log1p(y) - np.log1p(p)) ** 2)))
+def mape(y, p):
+    """Mean Absolute Percentage Error, as a 0-100 percent (not 0-1).
+
+    Guard: today's callers only ever pass predictions files produced by
+    train_save_script21.py, where salevalue is floored to > args.min_salevalue
+    (default > 0) before training, so `y` is guaranteed non-zero in practice.
+    The y==0 guard below exists defensively for anyone pointing this same
+    evaluator at an arbitrary/older predictions file where that floor may not
+    hold -- those rows are excluded from the mean rather than producing inf/NaN.
+    """
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pct_err = np.abs((y - p) / y)
+    pct_err = np.where(y == 0, np.nan, pct_err)
+    return float(np.nanmean(pct_err) * 100.0)
 def coverage(y, lo, hi): return float(np.mean((y >= lo) & (y <= hi)))
 
 
@@ -50,7 +71,7 @@ def _block_metrics(actual, p5, p50, p95) -> Dict:
     if n == 0:
         return {
             'N': 0,
-            'MAE_p50': None, 'RMSE_p50': None, 'RMSLE_p50': None,
+            'MAE_p50': None, 'RMSE_p50': None, 'RMSLE_p50': None, 'MAPE_p50': None,
             'coverage_90': None, 'mean_ci_width': None,
             'mean_actual': None, 'mean_pred_p50': None, 'bias_p50': None,
         }
@@ -63,6 +84,7 @@ def _block_metrics(actual, p5, p50, p95) -> Dict:
         'MAE_p50':        mae(actual, p50),
         'RMSE_p50':       rmse(actual, p50),
         'RMSLE_p50':      rmsle(actual, p50),
+        'MAPE_p50':       mape(actual, p50),
         'coverage_90':    coverage(actual, p5, p95),
         'mean_ci_width':  float(np.mean(p95 - p5)),
         'mean_actual':    float(np.mean(actual)),
@@ -82,6 +104,7 @@ def _print_block(name: str, m: Dict):
         f"MAE=${m['MAE_p50']:>7.0f}  "
         f"RMSE=${m['RMSE_p50']:>7.0f}  "
         f"RMSLE={m['RMSLE_p50']:>6.4f}  "
+        f"MAPE={m['MAPE_p50']:>6.1f}%  "
         f"Cov90={m['coverage_90']*100:>5.1f}%  "
         f"Width=${m['mean_ci_width']:>7.0f}  "
         f"Bias=${m['bias_p50']:>+7.0f}"
@@ -93,7 +116,8 @@ def evaluate(df: pd.DataFrame, label: str = "predictions",
     """Compute and (optionally) print/save full metrics.
 
     Required columns: salevalue, p5, p50, p95
-    Optional column:  is_cult  (enables route-level breakdown)
+    Optional columns: is_cult       (enables route-level breakdown)
+                       record_creation_date (enables month-level breakdown)
 
     Returns the metrics dict (also saved to JSON if save_json_to is set).
     """
@@ -111,6 +135,7 @@ def evaluate(df: pd.DataFrame, label: str = "predictions",
     out['overall']    = _block_metrics(actual, p5, p50, p95)
     out['by_tier']    = {}
     out['by_route']   = {}
+    out['by_month']   = {}
 
     # Per-tier
     tiers = pd.cut(actual, bins=TIER_EDGES, labels=TIER_LABELS, right=True, include_lowest=True)
@@ -127,6 +152,20 @@ def evaluate(df: pd.DataFrame, label: str = "predictions",
         out['by_route']['non_cult'] = _block_metrics(
             actual[~is_cult], p5[~is_cult], p50[~is_cult], p95[~is_cult])
 
+    # Per-month (calendar month of record_creation_date), if that column is
+    # present. Use to_period('M') rather than strftime so NaT stays a typed
+    # null through the `valid` mask instead of becoming the literal string
+    # 'NaT' that would need its own special-casing downstream.
+    if DATE_COL in df.columns:
+        dt = pd.to_datetime(df[DATE_COL], errors='coerce')
+        valid = dt.notna()
+        month_key = pd.Series(pd.NA, index=df.index, dtype=object)
+        month_key.loc[valid] = dt[valid].dt.to_period('M').astype(str)  # 'YYYY-MM'
+        month_key = month_key.values
+        for mth in sorted(set(month_key[valid.values])):
+            m = (month_key == mth)
+            out['by_month'][mth] = _block_metrics(actual[m], p5[m], p50[m], p95[m])
+
     if verbose:
         print("=" * 100)
         print(f"METRICS — {label}  (n={len(df):,})")
@@ -141,6 +180,11 @@ def evaluate(df: pd.DataFrame, label: str = "predictions",
             print("By route (cult / non-cult):")
             for r in ['cult', 'non_cult']:
                 _print_block(r, out['by_route'][r])
+        if out['by_month']:
+            print()
+            print("By month:")
+            for mth in out['by_month']:
+                _print_block(mth, out['by_month'][mth])
         print()
         # Honest reminder if this is a train file
         if label.lower().startswith('train'):
