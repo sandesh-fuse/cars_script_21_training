@@ -9,14 +9,19 @@ Auth:
     Token is cached and refreshed when expired.
 
 Generation:
-    POST {WATSONX_URL}/ml/v1/text/generation?version=2024-05-31
-    Body: {"input": "...", "model_id": "...", "project_id": "...", "parameters": {...}}
+    POST {WATSONX_URL}/ml/v1/text/chat?version=2024-05-31
+    Body: {"messages": [{"role": "user", "content": "..."}], "model_id": "...",
+           "project_id": "...", "max_tokens": ..., "temperature": ...}
+    (The older /ml/v1/text/generation "input"-style endpoint is deprecated by
+    IBM in favor of this chat-completions-style endpoint; migrated 2026-08-26.)
 
 Environment variables (all required):
     WATSONX_API_KEY    — your IBM Cloud API key
     WATSONX_PROJECT_ID — watsonx.ai project ID
     WATSONX_URL        — base URL, e.g. https://us-south.ml.cloud.ibm.com
-    WATSONX_MODEL_ID   — e.g. ibm/granite-3-2-2b-instruct
+    WATSONX_MODEL_ID   — e.g. ibm/granite-4-h-small (verify against your
+                          project's available models — IBM periodically
+                          retires older model IDs, e.g. ibm/granite-3-8b-instruct)
 
 If credentials are missing or generation fails, returns a templated fallback
 that includes the SHAP data but without LLM-generated prose.
@@ -41,7 +46,7 @@ class WatsonxGraniteClient:
         self.project_id = os.environ.get("WATSONX_PROJECT_ID", "").strip()
         self.base_url = os.environ.get("WATSONX_URL", "").strip().rstrip("/")
         self.model_id = os.environ.get(
-            "WATSONX_MODEL_ID", "ibm/granite-3-8b-instruct"
+            "WATSONX_MODEL_ID", "ibm/granite-4-h-small"
         ).strip()
         self._token: Optional[str] = None
         self._token_expires_at: float = 0
@@ -78,19 +83,21 @@ class WatsonxGraniteClient:
     def generate(
         self, prompt: str, max_new_tokens: int = 1000, temperature: float = 0.3
     ) -> str:
-        """Call watsonx.ai text generation. Returns the generated string."""
-        url = f"{self.base_url}/ml/v1/text/generation?version=2024-05-31"
+        """Call watsonx.ai text chat completions. Returns the generated string.
+
+        Uses /ml/v1/text/chat, not the older /ml/v1/text/generation endpoint
+        (which IBM has deprecated and warns "will be removed soon"). The chat
+        API takes a "messages" array and "max_tokens" instead of "input" and
+        "max_new_tokens"/"decoding_method"/"min_new_tokens"/"repetition_penalty"
+        — those older sampling knobs have no equivalent here and are dropped.
+        """
+        url = f"{self.base_url}/ml/v1/text/chat?version=2024-05-31"
         body = {
-            "input": prompt,
             "model_id": self.model_id,
             "project_id": self.project_id,
-            "parameters": {
-                "decoding_method": "greedy" if temperature == 0 else "sample",
-                "max_new_tokens": max_new_tokens,
-                "min_new_tokens": 30,
-                "temperature": temperature,
-                "repetition_penalty": 1.05,
-            },
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
         }
         headers = {
             "Authorization": f"Bearer {self._get_token()}",
@@ -103,9 +110,17 @@ class WatsonxGraniteClient:
             self._token = None
             headers["Authorization"] = f"Bearer {self._get_token()}"
             resp = requests.post(url, headers=headers, json=body, timeout=60)
+        if not resp.ok:
+            # Surface IBM's error body (e.g. model_not_supported) in the logs
+            # instead of a bare "404 Client Error" with no detail.
+            logger.warning(
+                "watsonx.ai chat call failed (%s): %s",
+                resp.status_code,
+                resp.text[:2000],
+            )
         resp.raise_for_status()
         result = resp.json()
-        generated = result.get("results", [{}])[0].get("generated_text", "")
+        generated = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         return generated.strip()
 
 
