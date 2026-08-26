@@ -11,7 +11,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source. Artifacts are NOT copied — they get mounted as a volume.
+# Copy source, then artifacts. Artifacts are baked into the image (not
+# mounted as a volume) so it's self-contained for deployment — the
+# docker-compose.yml volume-mount block is commented out to match.
 COPY preprocessor.py shap_dollar_helper.py ./
 COPY app/ ./app/
 COPY ./artifacts/ /app/artifacts/

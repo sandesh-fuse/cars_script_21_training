@@ -15,5 +15,9 @@ venv/
 .pytest_cache
 .DS_Store
 README.md
-artifacts/         # mounted as volume at runtime
-tests/             # not needed at runtime
+# artifacts/ intentionally NOT ignored — Dockerfile COPYs it into the image
+# (see Dockerfile). If you switch to mounting it as a volume instead, add
+# an "artifacts/" line back here (on its own, .dockerignore doesn't support
+# trailing inline comments — a commented-out example above was a no-op).
+# tests/ — not needed at runtime
+tests/
