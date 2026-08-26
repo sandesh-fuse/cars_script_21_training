@@ -4,9 +4,9 @@ schemas.py
 Pydantic request/response models for the /predict endpoint.
 """
 
-from typing import Optional, List, Any, Dict
-from pydantic import BaseModel, Field
-from datetime import datetime
+from typing import Optional, List, Any, Dict, Union
+from pydantic import BaseModel, Field, model_validator, field_validator
+from datetime import datetime, timezone
 
 
 class PredictRequest(BaseModel):
@@ -14,56 +14,140 @@ class PredictRequest(BaseModel):
 
     The preprocessor handles missing fields gracefully (treats as NaN).
     Field names must match the column names in your training CSV.
+
+    Trimmed to the fields actually consumed by the currently-deployed
+    script21 model (per artifacts/script21/training_metadata.json:
+    use_dataone=False, enabled_new_features=[]), PLUS the fields the live
+    upstream payload always sends regardless (vin, other_damages,
+    oem_body_style, drive_type, msrp — see their own notes below). Config.
+    extra is "forbid" (not "allow"), so every field a real request can
+    carry must be declared here or the whole request 422s.
+
+    Two toggle-gated groups are still intentionally omitted below because
+    the deployed config has them off AND the live payload never sends them:
+      - Remaining DataOne spec fields (engine_name, engineconfiguration,
+        enginecylinders, enginehp, displacementl, valvetraindesign,
+        transmission_name, us_style_name) — only read when a model is
+        retrained with --use-dataone.
+      - NEW_FEATURE_COLS fields (true_mileage_unknown, clean_title,
+        gvm_range, tonnage, engine_type) — only read when a model is
+        retrained with --enable-new-features.
+    Re-add any of the above explicitly here if/when a deployed model
+    starts using it and the upstream payload starts sending it.
+    Also dropped for being unused in every config, not just this one —
+    never populated by any known training data source: vin_id, oem_doors,
+    rear_axle, model_number.
+
+    vin is dropped outright by preprocessor.py's DROP_COLS_NO_ZIP ('vin'
+    listed alongside vin_hin_no/api_log_id/bodypaint_id) — it never reaches
+    the model as a feature, regardless of config. Declared here purely so
+    the live payload (which always includes it) validates under
+    extra="forbid"; it has zero effect on predictions.
+
+    other_damages IS genuinely consumed: preprocessor.py's
+    _parse_other_damages() derives has_other_damage / n_other_damages /
+    other_damages_normalized / per-damage-type indicator features from it,
+    then drops the raw column. Typed Optional[Union[str, List[Any]]]
+    because that method accepts three shapes on this field: plain text
+    ('mold, other*'), a JSON-encoded string of {'id','name'} dicts (the
+    training-data format), or — per its own inline comment covering live
+    API callers specifically — an actual JSON list of plain strings or
+    {'name': ...} dicts.
+
+    oem_body_style / drive_type / msrp are DataOne spec fields (see
+    DATAONE_FEATURES in train_save_script21.py), gated by --use-dataone at
+    training time. The currently-deployed model was trained with
+    use_dataone=False, so these three sit outside its feature_cols_ and
+    have zero effect on today's predictions — but the live payload
+    consistently includes them, so they're declared here (rather than left
+    to extra="allow") purely to keep real requests from 422ing. msrp is
+    typed Optional[Union[str, int, float]], the same str-or-number
+    convention as vazipcode/doors/vehicle_type/nav_color below, because the
+    live payload sends it as a JSON string ('"17500"') despite being
+    numeric, and preprocessor.py has no bespoke coercion for it (unlike
+    vazipcode's regex-extract) — it's a raw DataOne passthrough.
+
+    vehicle_type / nav_color are typed as str-or-number: in the taegram
+    training export, these two arrive as unresolved numeric picklist IDs
+    (e.g. 23101.0), not text — unlike every other picklist-sourced field,
+    which has a resolved *_picklist_id_name text column. The deployed
+    model was trained on those raw numbers, never int-encoded, so at
+    inference time a NUMBER for either field reaches the model as-is and
+    predicts fine; a STRING for either field still reaches the model
+    (nothing rejects it here) but currently makes XGBoost raise a dtype
+    error, because the fitted preprocessor never learned an encoding for
+    string values in these two columns. Known, unfixed (see project
+    memory: script21-vehicle-type-color-picklist-bug) — send a number for
+    these two specifically.
+
+    doors is ALSO typed str-or-number, for a related but distinct reason:
+    the raw taegram 'doors' column isn't cleanly numeric across the full
+    training set (stray junk values like '2500', '2.4l', 'lt' show up
+    alongside real door counts), so the WHOLE column got fit as a text
+    category, not a numeric passthrough (confirmed:
+    preprocessor_standard.joblib's int_maps_['doors'] has string keys like
+    '4.0'/'4' as DIFFERENT trained categories, not a numeric feature at
+    all). A caller sending doors=4 as a plain int previously got silently
+    coerced to Python int 4 by the old `Optional[int]` typing, which
+    doesn't match either learned string key -- degrading to the model's
+    "unknown door count" category every time. Send a genuine number here
+    (int or float both work) and it's rendered to match the dominant
+    '<N>.0'-style trained category, same convention as vehicle_type/
+    nav_color; a string still passes through unchanged too.
+
+    vazipcode accepts str-or-number too, but for a benign reason (unlike
+    the three above): preprocessor.py's zip handling does
+    `.astype(str).str.extract(r'(\\d{1,5})')` on it regardless of input
+    type, so "52732.0"/52732.0/52732/"52732" all extract to the identical
+    '52732' before being zero-padded and fanned out into zip_region/
+    zip_first2/zip_first3/zip_lat/zip_lon/zip_full_freq (verified). The old
+    Optional[str]-only typing didn't match anything wrong -- it just
+    rejected a caller sending the ZIP as a JSON number with an avoidable
+    422 before ever reaching that already-robust code.
+
+    accessiblefortwotruck / locatedatdonationca stay Optional[str]
+    deliberately, NOT bool, even though they're plain true/false flags:
+    both are int-encoded categoricals trained on the STRING keys
+    'true'/'false' (preprocessor_standard.joblib's int_maps_ confirms
+    exactly {'true': 0, 'false': 1} for each). A genuine Python bool lands
+    as `bool` dtype in the single-row DataFrame Script21Pipeline.predict()
+    builds, which preprocessor.py's _normalize_text() silently skips (it
+    only touches object-dtype columns) -- so it would never get
+    lowercased/stringified and would fail to match either trained category,
+    same failure mode vehicle_type/nav_color/doors had before their fixes
+    above. Fixable with a downstream bool->string coercion (considered,
+    deliberately not added) -- until then, keep these Optional[str] and
+    send the literal string "true"/"false".
     """
 
     # Identifiers
     stock_id: Optional[str] = None
-    vin_id: Optional[str] = None
+    # vin: Optional[str] = None
 
     # Core vehicle attrs
     make: Optional[str] = None
     model: Optional[str] = None
     year: Optional[int] = None
     trim: Optional[str] = None
-    vehicle_type: Optional[str] = None
+    vehicle_type: Optional[Union[str, int, float]] = None
     body_type: Optional[str] = None
     body_subtype: Optional[str] = None
-    drive_type: Optional[str] = None
-    doors: Optional[int] = None
-    oem_doors: Optional[int] = None
-    oem_body_style: Optional[str] = None
-    us_style_name: Optional[str] = None
-    model_number: Optional[str] = None
-    msrp: Optional[float] = None
+    doors: Optional[Union[str, int, float]] = None
     mileage: Optional[float] = None
-    true_mileage_unknown: Optional[bool] = None
-    clean_title: Optional[bool] = None
-    gvm_range: Optional[str] = None
-    tonnage: Optional[float] = None
-
-    # Engine & Transmission attrs
-    engine_name: Optional[str] = None
-    engine_type: Optional[str] = None
-    engineconfiguration: Optional[str] = None
-    enginecylinders: Optional[float] = None
-    enginehp: Optional[float] = None
-    displacementl: Optional[float] = None
-    valvetraindesign: Optional[str] = None
-    transmission_name: Optional[str] = None
-    rear_axle: Optional[str] = None
 
     # Condition & Visual attrs
     nav_condition: Optional[str] = None
-    nav_color: Optional[str] = None
+    nav_color: Optional[Union[str, int, float]] = None
     bodypaintcondition: Optional[str] = None
     enginecondition: Optional[str] = None
     transmissioncondition: Optional[str] = None
     tirecondition: Optional[str] = None
     interiorcondition: Optional[str] = None
+    other_damages: Optional[Union[str, List[Any]]] = None
+    all_clean_notes: Optional[str] = None
 
     # Geo, Admin, and Flags
-    # is_valid_vin: Optional[bool] = None
-    vazipcode: Optional[str] = None
+    vazipcode: Optional[Union[str, int, float]] = None
     vstate_name: Optional[str] = None
     state_province_of_title: Optional[str] = None
     accessiblefortwotruck: Optional[str] = None
@@ -72,9 +156,10 @@ class PredictRequest(BaseModel):
     # Date — defaults to today if not provided
     record_creation_date: Optional[str] = None
 
-    # Any extra fields the client sends are silently ignored at preprocessing
+    # Unrecognized fields are rejected (422) rather than silently ignored —
+    # every field a real request can carry must be declared explicitly above.
     class Config:
-        extra = "allow"
+        extra = "forbid"
 
 
 class ShapFeatureRecord(BaseModel):
@@ -113,20 +198,60 @@ class PredictResponse(BaseModel):
 
 
 class LogsQueryRequest(BaseModel):
-    """Request body for fetching logs."""
+    """Request body for fetching logs.
+
+    Only two time-window modes are accepted:
+      - relative: days_ago and/or minutes_ago
+      - absolute: start_time AND end_time (both required together)
+    Mixing the two modes in one request is rejected.
+    """
 
     stock_id: Optional[str] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    days_ago: Optional[int] = 7
+    days_ago: Optional[int] = None
     minutes_ago: Optional[int] = None
-    limit: Optional[int] = None
+    limit: Optional[int] = Field(default=200, ge=1, le=200)
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def _require_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is None:
+            return v
+        if v.tzinfo is None:
+            raise ValueError(
+                "start_time/end_time must be UTC with an explicit offset, "
+                "e.g. '2026-01-01T00:00:00Z'."
+            )
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _validate_time_window(self):
+        has_start = self.start_time is not None
+        has_end = self.end_time is not None
+        has_relative = self.days_ago is not None or self.minutes_ago is not None
+
+        if has_start != has_end:
+            raise ValueError(
+                "start_time and end_time must both be provided together."
+            )
+
+        has_range = has_start and has_end
+
+        if has_range and has_relative:
+            raise ValueError(
+                "Provide either days_ago/minutes_ago or start_time/end_time, not both."
+            )
+
+        if not has_range and not has_relative:
+            self.days_ago = 7  # default relative window when nothing is specified
+
+        return self
 
 
 class LogsResponse(BaseModel):
     """Response structure for the logs endpoint."""
 
-    query_executed: str
     time_window: Dict[str, str]
     log_count: int
     logs: List[Dict[str, Any]]

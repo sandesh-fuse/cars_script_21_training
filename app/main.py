@@ -207,7 +207,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         else:
             clean_msg = msg.replace("Value error, ", "")
             if field_name != "body" and not field_name.isdigit():
-                other_errors.append(f"{clean_msg}")
+                other_errors.append(f"{field_name}: {clean_msg}")
 
     diagnostics_parts = []
     if missing_fields:
@@ -316,9 +316,9 @@ def health(request: Request):
         },
     )
     return {
-        "ok": True,
-        "script17_loaded": SCRIPT17_PIPELINE is not None,
-        "script21_loaded": SCRIPT21_PIPELINE is not None,
+        "status": "running",
+        # "script17_loaded": SCRIPT17_PIPELINE is not None,
+        "model_loaded": SCRIPT21_PIPELINE is not None,
     }
 
 
@@ -397,23 +397,64 @@ def predict(
         payload = [payload]
 
     batch_size = len(payload)
-    input_stock_ids = []
+    # Computed upfront (not built incrementally in the loop below) so the
+    # "requested" log always reflects the full input, and so it's still
+    # available in full even if processing fails partway through the batch.
+    input_stock_ids = [(item.stock_id or "unknown") for item in payload]
     output_log_data = []
     final_responses = []
 
     total_t_predict = 0.0
     total_t_explain = 0.0
 
+    # Logged unconditionally, before any processing -- this fires no matter
+    # what happens next (success or failure), so /logs can filter on
+    # stock_id and always find at least this entry for a given request.
+    logger.info(
+        f"Prediction {model} requested",
+        extra={
+            "request_id": req_id,
+            "endpoint": "/predict",
+            "model_version": model,
+            "user_id": user_id,
+            "client_ip": client_ip,
+            "batch_size": batch_size,
+            "input_stock_ids": input_stock_ids,
+            "explain_requested": explain_flag,
+            "shap_quantile": shap_quantile,
+        },
+    )
+
     try:
         # Loop through each item in the normalized list
-        for item in payload:
+        for idx, item in enumerate(payload):
+            # exclude_none=False (NOT True) is required for correctness, not
+            # just style: preprocessor.py's feature engineering guards
+            # (`if col in X.columns`, `if set(src).issubset(X.columns)`)
+            # treat an ABSENT column completely differently from a
+            # PRESENT-but-NaN one. Training always sees every raw column
+            # (just sometimes NaN, correctly encoded to the model's learned
+            # "unknown" category -- e.g. a "make__na"-style combo index).
+            # exclude_none=True silently drops any field the caller omitted,
+            # so the single-row DataFrame built in Script21Pipeline.predict()
+            # is MISSING that column outright -- every combo/frequency
+            # feature built from it then gets skipped entirely and back-
+            # filled with a bare NaN instead of the trained "unknown"
+            # encoding, silently degrading predictions for any request with
+            # missing fields (confirmed via validate_live_predictions.py:
+            # 14 of 130 features differed for a real row with a few missing
+            # attributes, fully explaining a systematic live-vs-offline MAE
+            # gap). See app/inference_script21.py's None->NaN coercion for
+            # the other half of this fix.
             try:
-                request_dict = item.dict(exclude_none=True)
-            except AttributeError:  # pydantic v2
-                request_dict = item.model_dump(exclude_none=True)
+                request_dict = item.model_dump(exclude_none=False)
+            except AttributeError:  # pydantic v1
+                request_dict = item.dict(exclude_none=False)
 
-            stock_id = request_dict.get("stock_id", "unknown")
-            input_stock_ids.append(stock_id)
+            # Precomputed upfront (see input_stock_ids above), not
+            # re-derived here -- keeps this in lockstep with the value
+            # already logged on the "requested" log line for this request.
+            stock_id = input_stock_ids[idx]
 
             t0 = time.time()
             pred_result = pipeline.predict(
@@ -502,6 +543,7 @@ def predict(
                 "client_ip": client_ip,
                 "batch_size": batch_size,
                 "inference_duration_seconds": round(inference_duration_seconds, 4),
+                "input_stock_ids": input_stock_ids,
                 "output_data": output_log_data,
                 "total_ms": round(total_time, 2),
             },

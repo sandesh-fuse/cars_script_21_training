@@ -66,6 +66,18 @@ class Script21Pipeline:
         explain: bool = False,
     ):
         df = pd.DataFrame([request_dict])
+        # app/main.py now sends exclude_none=False (every declared field
+        # present, None when the caller omitted it) specifically so every
+        # raw column preprocessor.py expects exists here -- but a Python
+        # None stored in an object-dtype column is NOT the same thing as a
+        # real NaN to _normalize_text()/_basic_clean(): `.astype(str)` on
+        # None gives the literal string "None" -> "none" after lowercasing,
+        # which is NOT caught by their `s != 'nan'` NaN-recovery check, so
+        # it would silently become a bogus real category. Coerce explicitly
+        # so every "field wasn't provided" case behaves exactly like a
+        # genuinely-missing value in the training data (which is what
+        # `.fillna(-1)`/`.fillna('na')` downstream are built to expect).
+        df = df.where(df.notna(), np.nan)
         if (
             "record_creation_date" not in df.columns
             or df["record_creation_date"].isna().all()
@@ -101,7 +113,7 @@ class Script21Pipeline:
             if hasattr(X, "copy")
             else pd.DataFrame(X, columns=pre.feature_cols_)
         )
-        X_csv["stock_id"] = request_dict.get("stock_id", "unknown")
+        X_csv["stock_id"] = request_dict.get("stock_id") or "unknown"
 
         csv_file = "api_engineered_features.csv"
         X_csv.to_csv(

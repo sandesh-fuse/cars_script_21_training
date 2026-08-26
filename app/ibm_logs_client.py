@@ -1,11 +1,12 @@
 # ================
 # File: app/ibm_logs_client.py
 # ================
-import os
 import json
-import httpx
+import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
+
+import httpx
 
 
 async def fetch_and_format_logs(
