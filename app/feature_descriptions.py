@@ -151,6 +151,42 @@ HUMAN_READABLE = {
     'damage_x_age':               'Damage × age interaction',
     'damage_x_mileage_bkt':       'Damage × mileage bucket',
     'damage_x_mileage_bkt_freq':  'Damage × mileage bucket (frequency)',
+
+    # New raw categoricals (NEW_FEATURE_COLS; gated by --enable-new-features)
+    'true_mileage_unknown':       'Odometer reading may be inaccurate',
+    'clean_title':                'Clean title',
+    'gvm_range':                  'Gross vehicle weight (GVM) range',
+    'tonnage':                    'Tonnage/weight class',
+    'engine_type':                'Engine type',
+
+    # Mileage-trust interactions
+    'mileage_unknown_x_age':            'Odometer trust × age',
+    'mileage_unknown_x_mileage_bucket': 'Odometer trust × mileage bucket',
+    'mileage_unknown_x_make':           'Odometer trust × make',
+    'mileage_unknown_x_n_unknowns':     'Odometer trust × unknown-condition count',
+
+    # Clean-title interactions
+    'clean_title_x_age':            'Clean title × age',
+    'clean_title_x_mileage_bucket': 'Clean title × mileage bucket',
+
+    # Worst-dollar-error-tier interactions (WORST_TIER_FEATURE_COLS)
+    'unknowns_x_mileage_bkt':       'Unknown-condition count × mileage bucket',
+    'unknowns_x_age_bkt':           'Unknown-condition count × age bucket',
+    'mech_severity_x_mileage_bkt':  'Mechanical severity × mileage bucket',
+    'cult_x_n_unknowns':            'Cult status × unknown-condition count',
+    'vtype_x_mileage_bkt':          'Vehicle type × mileage bucket',
+
+    # Condition-x-make interactions (CONDITION_MAKE_FEATURE_COLS)
+    'runs_x_make':                  'Driveability × make',
+    'mech_severity_x_make':         'Mechanical severity × make',
+    'all_cond_combo_x_make':        'Overall condition combo × make',
+
+    # Original pass-through columns missing a label (always present)
+    'Specialty Item':               'Flagged as a specialty item (RV/boat/heavy equipment)',
+    'all_clean_notes':              'Donor/pickup notes',
+    'vstate_name':                  'State (from title/registration)',
+    'accessiblefortwotruck':        'Accessible for tow truck',
+    'locatedatdonationca':          'Located at donation center',
 }
 
 # Suffix-based fallbacks

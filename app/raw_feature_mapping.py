@@ -176,6 +176,28 @@ EXACT_MAP: Dict[str, tuple] = {
     'damage_x_age':                BUCKET_DAMAGE,
     'damage_x_mileage_bkt':        BUCKET_DAMAGE,
     'damage_x_mileage_bkt_freq':   BUCKET_DAMAGE,
+
+    # --- Worst-dollar-error-tier interactions (WORST_TIER_FEATURE_COLS) ---
+    'unknowns_x_mileage_bkt':       BUCKET_UNKNOWNS,
+    'unknowns_x_age_bkt':           BUCKET_UNKNOWNS,
+    'mech_severity_x_mileage_bkt':  BUCKET_MECH,
+    'cult_x_n_unknowns':            BUCKET_CULT,
+    'vtype_x_mileage_bkt':          ('vehicle_type', 'Vehicle type'),
+
+    # --- Condition-x-make interactions (CONDITION_MAKE_FEATURE_COLS) ---
+    'runs_x_make':                  ('nav_condition', 'Driveability condition'),
+    'mech_severity_x_make':         BUCKET_MECH,
+    'all_cond_combo_x_make':        ('nav_condition', 'Driveability condition'),
+
+    # --- Mileage-trust interactions (true_mileage_unknown; NEW_FEATURE_COLS) ---
+    'mileage_unknown_x_age':            ('true_mileage_unknown', 'Odometer reading may be inaccurate'),
+    'mileage_unknown_x_mileage_bucket': ('true_mileage_unknown', 'Odometer reading may be inaccurate'),
+    'mileage_unknown_x_make':           ('true_mileage_unknown', 'Odometer reading may be inaccurate'),
+    'mileage_unknown_x_n_unknowns':     ('true_mileage_unknown', 'Odometer reading may be inaccurate'),
+
+    # --- Clean-title interactions (NEW_FEATURE_COLS) ---
+    'clean_title_x_age':            ('clean_title', 'Clean title'),
+    'clean_title_x_mileage_bucket': ('clean_title', 'Clean title'),
 }
 
 # Suffix rules applied if no exact match.

@@ -633,6 +633,17 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             """Return list of normalized damage type strings from one cell."""
             if v is None or (isinstance(v, float) and pd.isna(v)):
                 return []
+            # A live API request can send other_damages as an actual JSON list
+            # (e.g. ["Mold", "Rust"]) rather than the training data's string
+            # formats. Handle that BEFORE the str(v) conversion below, since
+            # str(["Mold"]) -> "['Mold']" (Python repr, not JSON) would fail
+            # the JSON branch and get mangled by the plain-text comma-split
+            # fallback instead. Accepts a list of plain strings or a list of
+            # {'name': ...} dicts, matching the existing JSON-object format.
+            if isinstance(v, list):
+                names = [it.get('name', '') if isinstance(it, dict) else str(it)
+                          for it in v]
+                return [self._normalize_damage_token(n) for n in names if n]
             s = str(v).strip()
             if not s or s.lower() in ('nan', 'none', 'null'):
                 return []
