@@ -1074,17 +1074,24 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         return X
 
     def _basic_clean(self, X):
-        # Step 0: normalize new-DB-schema column names onto the legacy names
-        # the rest of this method (and the caller-supplied extra_drop_cols/
-        # TARGET_ENC_COLS/etc. below) is written against. No-op if X is
-        # already legacy-schema or was already renamed by the caller (e.g.
-        # train_save_script21.py calls this early too, for its own
-        # pre-preprocessing row filtering). This is what lets
-        # app/inference_script21.py hand this class a DataFrame built
-        # straight from the new-schema PredictRequest fields with zero
-        # translation step of its own.
-        X = map_raw_features_to_legacy(X)
-
+        # NOTE: renaming new-DB-schema column names onto the legacy names
+        # this method is written against is the CALLER's job (via
+        # map_raw_features_to_legacy()), not done automatically here.
+        # train_save_script21.py's main(), and app/inference_script21.py /
+        # app/inference_script17.py's predict(), all call it explicitly
+        # before fit()/transform() ever runs (they need to -- they read
+        # columns like salevalue/record_creation_date/vazipcode directly,
+        # before this method would get a chance to). An automatic call used
+        # to live here too, as a safety net for a caller that forgot to
+        # rename -- removed because it's unsafe to call twice: renaming is
+        # NOT idempotent in one specific case (vehicle_category -> body_type
+        # is a legacy TARGET that collides with the unrelated DataOne raw
+        # 'body_type' -> oem_body_style RENAME SOURCE), so a caller that
+        # already renamed once and then hit this automatic second call would
+        # see 'vehicle_category' silently renamed twice into 'oem_body_style'
+        # and dropped (since oem_body_style is excluded when --use-dataone is
+        # off) -- exactly what was happening here before this fix.
+        #
         # Step 1: coalesce paired (nav_*, primary) columns. Prefer nav_*, fall
         # back to the primary field. The unified value lives in the primary
         # column. After coalesce both source columns become equivalent so we
