@@ -103,9 +103,21 @@ DATAONE_RAW_SOURCE_COLS = [
 # main()), unioned with DATAONE_RAW_SOURCE_COLS when --use-dataone is passed
 # -- so by default nothing outside this list, in particular the resolved
 # *_name text columns, ever reaches the pipeline.
+#
+# vehicle_type is the one addition beyond the original eda.ipynb/whitelist
+# reference list: it's ~98.5% populated in the real data (unlike
+# vehicle_category's ~11%) and was a real, actively-used feature in the
+# pre-migration baseline -- both directly and via 4 derived interaction
+# features (make_x_vehicle_type, vtype_x_mileage_bkt, vtype_x_nav_condition,
+# zip_region_x_vehicle_type). Its absence was the single largest driver of
+# a MAE regression (513 -> 535) measured after the initial migration. It's
+# the SAME raw column name in both schemas (no NEW_TO_OLD_SCHEMA_MAP entry
+# needed) and arrives as a numeric picklist ID already, matching color's
+# existing handling -- no other preprocessor.py change was needed to
+# support it, only including it in this read whitelist.
 SCRIPT21_RAW_COLUMNS = [
     'vin_hin_no', 'make', 'model', 'year', 'trim', 'vehicle_category',
-    'body_subtype', 'color', 'mileage',
+    'vehicle_type', 'body_subtype', 'color', 'mileage',
     'vehicle_cond_picklist_id', 'engine_cond_picklist_id',
     'transmission_cond_picklist_id', 'body_paint_cond_picklist_id',
     'interior_cond_picklist_id', 'tire_cond_picklist_id',

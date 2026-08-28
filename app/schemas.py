@@ -79,10 +79,13 @@ class PredictRequest(BaseModel):
     vehicle_type / color (legacy name: nav_color) are typed as
     str-or-number: in the taegram training export, these two arrive as
     unresolved numeric picklist IDs (e.g. 23101.0), not text. vehicle_type
-    has no new-schema equivalent column at all yet (dropped in this
-    migration's feature whitelist) and is kept here only because live
-    payloads still send it; color already arrived as a raw numeric ID even
-    before this migration (no color_name sibling ever existed). The
+    is the SAME raw column name in both schemas (no NEW_TO_OLD_SCHEMA_MAP
+    rename needed) and is now in train_save_script21.py's
+    SCRIPT21_RAW_COLUMNS whitelist -- it was excluded from the initial
+    migration's whitelist, which measurably regressed accuracy (it's
+    ~98.5% populated and drives 4 derived interaction features on top of
+    itself), so it was added back; color already arrived as a raw numeric
+    ID even before this migration (no color_name sibling ever existed). The
     deployed model was trained on those raw numbers, never int-encoded, so
     at inference time a NUMBER for either field reaches the model as-is and
     predicts fine; a STRING for either field still reaches the model
