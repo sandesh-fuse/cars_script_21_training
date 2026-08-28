@@ -13,12 +13,19 @@ class PredictRequest(BaseModel):
     """Request body for /predict — all car attribute fields are optional.
 
     The preprocessor handles missing fields gracefully (treats as NaN).
-    Field names must match the column names in your training CSV.
+    Field names now match the NEW upstream DB schema's raw column names
+    (the taegram export), NOT the legacy names preprocessor.py's feature
+    engineering is internally written against — preprocessor.py renames
+    them automatically (see NEW_TO_OLD_SCHEMA_MAP / map_raw_features_to_legacy
+    in preprocessor.py), so nothing in app/ needs to translate between the
+    two. Each field below that was renamed from a prior legacy name says so
+    in its own comment, for anyone cross-referencing older logs/artifacts/
+    SHAP payloads that still show the legacy name.
 
     Trimmed to the fields actually consumed by the currently-deployed
     script21 model (per artifacts/script21/training_metadata.json:
     use_dataone=False, enabled_new_features=[]), PLUS the fields the live
-    upstream payload always sends regardless (vin, other_damages,
+    upstream payload always sends regardless (vin, other_damage_pklist_id,
     oem_body_style, drive_type, msrp — see their own notes below). Config.
     extra is "forbid" (not "allow"), so every field a real request can
     carry must be declared here or the whole request 422s.
@@ -38,21 +45,23 @@ class PredictRequest(BaseModel):
     never populated by any known training data source: vin_id, oem_doors,
     rear_axle, model_number.
 
-    vin is dropped outright by preprocessor.py's DROP_COLS_NO_ZIP ('vin'
-    listed alongside vin_hin_no/api_log_id/bodypaint_id) — it never reaches
-    the model as a feature, regardless of config. Declared here purely so
-    the live payload (which always includes it) validates under
-    extra="forbid"; it has zero effect on predictions.
+    vin_hin_no (legacy name: vin) is dropped outright by preprocessor.py's
+    DROP_COLS_NO_ZIP — it never reaches the model as a feature, regardless
+    of config. Declared here purely so the live payload (which always
+    includes it) validates under extra="forbid"; it has zero effect on
+    predictions.
 
-    other_damages IS genuinely consumed: preprocessor.py's
-    _parse_other_damages() derives has_other_damage / n_other_damages /
-    other_damages_normalized / per-damage-type indicator features from it,
-    then drops the raw column. Typed Optional[Union[str, List[Any]]]
-    because that method accepts three shapes on this field: plain text
-    ('mold, other*'), a JSON-encoded string of {'id','name'} dicts (the
-    training-data format), or — per its own inline comment covering live
-    API callers specifically — an actual JSON list of plain strings or
-    {'name': ...} dicts.
+    other_damage_pklist_id (legacy name: other_damages) IS genuinely
+    consumed: preprocessor.py's _parse_other_damages() derives
+    has_other_damage / n_other_damages / other_damages_normalized /
+    per-damage-type indicator features from it, then drops the raw column.
+    Typed Optional[Union[str, int, float, List[Any]]] because that method
+    accepts several shapes: a bare numeric picklist ID (the new-schema
+    format — decoded via preprocessor.py's OTHER_DAMAGE_ID_TO_LABEL),
+    plain text ('mold, other*'), a JSON-encoded string of {'id','name'}
+    dicts (the training-data legacy format), or — per its own inline
+    comment covering live API callers specifically — an actual JSON list of
+    numeric picklist IDs, plain strings, or {'name': ...} dicts.
 
     oem_body_style / drive_type / msrp are DataOne spec fields (see
     DATAONE_FEATURES in train_save_script21.py), gated by --use-dataone at
@@ -62,17 +71,20 @@ class PredictRequest(BaseModel):
     consistently includes them, so they're declared here (rather than left
     to extra="allow") purely to keep real requests from 422ing. msrp is
     typed Optional[Union[str, int, float]], the same str-or-number
-    convention as vazipcode/doors/vehicle_type/nav_color below, because the
+    convention as zip/doors/vehicle_type/color below, because the
     live payload sends it as a JSON string ('"17500"') despite being
     numeric, and preprocessor.py has no bespoke coercion for it (unlike
-    vazipcode's regex-extract) — it's a raw DataOne passthrough.
+    zip's regex-extract) — it's a raw DataOne passthrough.
 
-    vehicle_type / nav_color are typed as str-or-number: in the taegram
-    training export, these two arrive as unresolved numeric picklist IDs
-    (e.g. 23101.0), not text — unlike every other picklist-sourced field,
-    which has a resolved *_picklist_id_name text column. The deployed
-    model was trained on those raw numbers, never int-encoded, so at
-    inference time a NUMBER for either field reaches the model as-is and
+    vehicle_type / color (legacy name: nav_color) are typed as
+    str-or-number: in the taegram training export, these two arrive as
+    unresolved numeric picklist IDs (e.g. 23101.0), not text. vehicle_type
+    has no new-schema equivalent column at all yet (dropped in this
+    migration's feature whitelist) and is kept here only because live
+    payloads still send it; color already arrived as a raw numeric ID even
+    before this migration (no color_name sibling ever existed). The
+    deployed model was trained on those raw numbers, never int-encoded, so
+    at inference time a NUMBER for either field reaches the model as-is and
     predicts fine; a STRING for either field still reaches the model
     (nothing rejects it here) but currently makes XGBoost raise a dtype
     error, because the fitted preprocessor never learned an encoding for
@@ -93,36 +105,60 @@ class PredictRequest(BaseModel):
     "unknown door count" category every time. Send a genuine number here
     (int or float both work) and it's rendered to match the dominant
     '<N>.0'-style trained category, same convention as vehicle_type/
-    nav_color; a string still passes through unchanged too.
+    color; a string still passes through unchanged too.
 
-    vazipcode accepts str-or-number too, but for a benign reason (unlike
-    the three above): preprocessor.py's zip handling does
-    `.astype(str).str.extract(r'(\\d{1,5})')` on it regardless of input
-    type, so "52732.0"/52732.0/52732/"52732" all extract to the identical
-    '52732' before being zero-padded and fanned out into zip_region/
-    zip_first2/zip_first3/zip_lat/zip_lon/zip_full_freq (verified). The old
-    Optional[str]-only typing didn't match anything wrong -- it just
-    rejected a caller sending the ZIP as a JSON number with an avoidable
-    422 before ever reaching that already-robust code.
+    zip (legacy name: vazipcode) accepts str-or-number too, but for a
+    benign reason (unlike the three above): preprocessor.py's zip handling
+    does `.astype(str).str.extract(r'(\\d{1,5})')` on it regardless of
+    input type, so "52732.0"/52732.0/52732/"52732" all extract to the
+    identical '52732' before being zero-padded and fanned out into
+    zip_region/zip_first2/zip_first3/zip_lat/zip_lon/zip_full_freq
+    (verified). The old Optional[str]-only typing didn't match anything
+    wrong -- it just rejected a caller sending the ZIP as a JSON number
+    with an avoidable 422 before ever reaching that already-robust code.
 
-    accessiblefortwotruck / locatedatdonationca stay Optional[str]
-    deliberately, NOT bool, even though they're plain true/false flags:
-    both are int-encoded categoricals trained on the STRING keys
-    'true'/'false' (preprocessor_standard.joblib's int_maps_ confirms
-    exactly {'true': 0, 'false': 1} for each). A genuine Python bool lands
-    as `bool` dtype in the single-row DataFrame Script21Pipeline.predict()
-    builds, which preprocessor.py's _normalize_text() silently skips (it
-    only touches object-dtype columns) -- so it would never get
-    lowercased/stringified and would fail to match either trained category,
-    same failure mode vehicle_type/nav_color/doors had before their fixes
-    above. Fixable with a downstream bool->string coercion (considered,
-    deliberately not added) -- until then, keep these Optional[str] and
-    send the literal string "true"/"false".
+    accessible_for_tow_truck (legacy: accessiblefortwotruck) /
+    located_at_donation_c_a (legacy: locatedatdonationca) stay
+    Optional[str] deliberately, NOT bool, even though they're plain
+    true/false flags: both are int-encoded categoricals trained on the
+    STRING keys 'true'/'false' (preprocessor_standard.joblib's int_maps_
+    confirms exactly {'true': 0, 'false': 1} for each). A genuine Python
+    bool lands as `bool` dtype in the single-row DataFrame
+    Script21Pipeline.predict() builds, which preprocessor.py's
+    _normalize_text() silently skips (it only touches object-dtype
+    columns) -- so it would never get lowercased/stringified and would
+    fail to match either trained category, same failure mode
+    vehicle_type/color/doors had before their fixes above. Fixable with a
+    downstream bool->string coercion (considered, deliberately not added)
+    -- until then, keep these Optional[str] and send the literal string
+    "true"/"false".
+
+    vehicle_cond_picklist_id / engine_cond_picklist_id /
+    transmission_cond_picklist_id / body_paint_cond_picklist_id /
+    interior_cond_picklist_id / tire_cond_picklist_id (legacy names:
+    nav_condition, enginecondition, transmissioncondition,
+    bodypaintcondition, interiorcondition, tirecondition) are typed
+    str-or-number: the new-schema/primary expected value is the numeric
+    picklist ID, but preprocessor.py's severity dicts (NAV_CONDITION_SEV /
+    BODY_SEV / ENGINE_SEV / TRANS_SEV / TIRE_SEV / INTERIOR_SEV) carry both
+    the numeric-ID keys AND the original text-label keys, built from a
+    confirmed ID<->name correspondence — so a legacy text value (e.g.
+    "Runs & Drives") still resolves to the identical severity as its
+    numeric-ID equivalent (22968) would. Send the numeric ID going
+    forward; text is accepted for backward compatibility, not because it's
+    the preferred format anymore.
+
+    state_title_picklist / state_picklist_id (legacy names:
+    state_province_of_title, vstate_name) are typed str-or-number for the
+    same reason, but with no ordinal meaning to preserve — both are
+    frequency/int-encoded as opaque categoricals either way (see
+    preprocessor.py's FREQ_COLS_BASE), so the raw numeric ID passes
+    straight through exactly as safely as the legacy text used to.
     """
 
     # Identifiers
     stock_id: Optional[str] = None
-    # vin: Optional[str] = None
+    # vin_hin_no: Optional[str] = None  # legacy name: vin
 
     # Core vehicle attrs
     make: Optional[str] = None
@@ -130,31 +166,31 @@ class PredictRequest(BaseModel):
     year: Optional[int] = None
     trim: Optional[str] = None
     vehicle_type: Optional[Union[str, int, float]] = None
-    body_type: Optional[str] = None
+    vehicle_category: Optional[str] = None  # legacy name: body_type
     body_subtype: Optional[str] = None
     doors: Optional[Union[str, int, float]] = None
     mileage: Optional[float] = None
 
     # Condition & Visual attrs
-    nav_condition: Optional[str] = None
-    nav_color: Optional[Union[str, int, float]] = None
-    bodypaintcondition: Optional[str] = None
-    enginecondition: Optional[str] = None
-    transmissioncondition: Optional[str] = None
-    tirecondition: Optional[str] = None
-    interiorcondition: Optional[str] = None
-    other_damages: Optional[Union[str, List[Any]]] = None
-    all_clean_notes: Optional[str] = None
+    vehicle_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: nav_condition
+    color: Optional[Union[str, int, float]] = None  # legacy name: nav_color
+    body_paint_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: bodypaintcondition
+    engine_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: enginecondition
+    transmission_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: transmissioncondition
+    tire_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: tirecondition
+    interior_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: interiorcondition
+    other_damage_pklist_id: Optional[Union[str, int, float, List[Any]]] = None  # legacy name: other_damages
+    comment: Optional[str] = None  # legacy name: all_clean_notes
 
     # Geo, Admin, and Flags
-    vazipcode: Optional[Union[str, int, float]] = None
-    vstate_name: Optional[str] = None
-    state_province_of_title: Optional[str] = None
-    accessiblefortwotruck: Optional[str] = None
-    locatedatdonationca: Optional[str] = None
+    zip: Optional[Union[str, int, float]] = None  # legacy name: vazipcode
+    state_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: vstate_name
+    state_title_picklist: Optional[Union[str, int, float]] = None  # legacy name: state_province_of_title
+    accessible_for_tow_truck: Optional[str] = None  # legacy name: accessiblefortwotruck
+    located_at_donation_c_a: Optional[str] = None  # legacy name: locatedatdonationca
 
     # Date — defaults to today if not provided
-    record_creation_date: Optional[str] = None
+    creation_datetime: Optional[str] = None  # legacy name: record_creation_date
 
     # Unrecognized fields are rejected (422) rather than silently ignored —
     # every field a real request can carry must be declared explicitly above.

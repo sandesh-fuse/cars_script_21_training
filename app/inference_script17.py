@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
+from preprocessor import map_raw_features_to_legacy
 from app.shap_utils import compute_user_shap_payload
 
 QUANTILE_LABELS = ["q05", "q50", "q95"]
@@ -68,6 +69,13 @@ class Script17Pipeline:
         """
         # Single-row DataFrame from request
         df = pd.DataFrame([request_dict])
+        # request_dict uses the CURRENT PredictRequest field names (new DB
+        # schema); rename onto the legacy names the date-injection check
+        # right below is written against. pre_te/pre_no_te.transform() would
+        # apply this same rename internally anyway (preprocessor.py's
+        # _basic_clean() calls it automatically), but on an internal copy
+        # AFTER this point -- this method reads `df` directly here too.
+        df = map_raw_features_to_legacy(df)
         if (
             "record_creation_date" not in df.columns
             or df["record_creation_date"].isna().all()

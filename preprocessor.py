@@ -205,35 +205,212 @@ def build_zip_lookup(zip_series):
     return out['latitude'].to_dict(), out['longitude'].to_dict()
 
 # ============================================================
+# NEW (upstream DB) SCHEMA -> LEGACY (this file's) SCHEMA
+# ============================================================
+# Owned here (not in a separate schema_adapter.py) so this module is
+# self-sufficient: any caller -- train_save_script21.py, app/inference_*.py,
+# a live request dict -- can hand this class a DataFrame using EITHER the
+# new upstream column names OR these legacy names directly, with no
+# translation-layer dependency of its own. Applied automatically as the
+# first step of _basic_clean() (see below), so it's transparent to every
+# caller; also exported for callers (train_save_script21.py) that need the
+# rename applied BEFORE their own pre-preprocessing logic runs (row
+# filtering on salevalue/record_creation_date, zip lookup, etc.).
+#
+# Condition/damage/state columns are keyed off the numeric picklist ID
+# (source of truth), not the resolved *_name text column -- see the
+# NAV_CONDITION_SEV/BODY_SEV/etc. dicts below, which carry both text-label
+# AND numeric-ID keys, so a value under either representation resolves to
+# the same severity.
+NEW_TO_OLD_SCHEMA_MAP = {
+    # --- Core target & time ---
+    "sale_value": "salevalue",
+    "creation_datetime": "record_creation_date",
+
+    # --- Condition & visuals ---
+    "vehicle_cond_picklist_id": "nav_condition",
+    "engine_cond_picklist_id": "enginecondition",
+    "transmission_cond_picklist_id": "transmissioncondition",
+    "body_paint_cond_picklist_id": "bodypaintcondition",
+    "interior_cond_picklist_id": "interiorcondition",
+    "tire_cond_picklist_id": "tirecondition",
+    "color": "nav_color",
+
+    # --- Engine & drivetrain (DataOne-sourced; see train_save_script21.py's
+    # DATAONE_FEATURES / --use-dataone) ---
+    "engines_name": "engine_name",
+    "transmissions_name": "transmission_name",
+    "ice_displacement": "displacementl",
+    "ice_cylinders": "enginecylinders",
+    "ice_block_type": "engineconfiguration",
+    "ice_max_hp": "enginehp",
+
+    # --- Core attributes & categoricals ---
+    "vehicle_category": "body_type",
+    "body_type": "oem_body_style",             # NOTE: incoming 'body_type' != legacy 'body_type' — see below
+    "accessible_for_tow_truck": "accessiblefortwotruck",
+    "located_at_donation_c_a": "locatedatdonationca",
+    "speciality_item": "Specialty Item",
+    "state_title_picklist": "state_province_of_title",
+    "us_styles": "us_style_name",
+    "state_picklist_id": "vstate_name",
+    "zip": "vazipcode",
+    "vin_hin_no": "vin",                    # currently inert: dropped outright by DROP_COLS_NO_ZIP
+    "comment": "all_clean_notes",              # currently inert: not read anywhere below
+
+    # --- Damage ---
+    # Decoded (scalar ID, or numeric IDs inside a live-request JSON list) via
+    # OTHER_DAMAGE_ID_TO_LABEL inside _parse_other_damages()/_extract_tokens()
+    # below, so this reduces to the exact same normalized tokens the *_name
+    # text used to produce.
+    "other_damage_pklist_id": "other_damages",
+}
+
+# `vehicle_category` -> `body_type` and `body_type` -> `oem_body_style` together mean the
+# raw incoming `body_type` column is repurposed as `oem_body_style`, NOT dropped — order of
+# operations in .rename() doesn't matter here since pandas renames off the ORIGINAL column
+# names simultaneously, not sequentially, so no chaining collision occurs.
+
+
+def _normalize_date_value(value):
+    """Parse one timestamp (ISO8601 or legacy format, tz-aware or naive) and
+    strip any timezone so it's safe to feed into columns that get bulk-parsed
+    downstream (pd.to_datetime is called on the whole column later).
+
+    Stripping tz here matters specifically because a training CSV spanning
+    the schema cutover will likely mix legacy tz-naive timestamps with new
+    tz-aware ISO8601 ones in the same column — pandas can outright fail to
+    parse a genuinely mixed-tz column even with errors='coerce'.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return value
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return value  # leave unparseable values alone; downstream errors='coerce' will drop them
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.isoformat()
+
+
+def map_raw_features_to_legacy(df):
+    """Rename a DataFrame's columns from the new DB schema to the legacy
+    schema this module's feature engineering is written against.
+
+    Safe to call on data that's already legacy-schema (or a mix of columns
+    from both, or already-renamed) — only columns present in
+    NEW_TO_OLD_SCHEMA_MAP are touched, everything else passes through
+    untouched, and it's a no-op the second time it's called on the same
+    frame. Called automatically inside _basic_clean() so any caller can
+    hand either schema straight to fit()/transform(); also safe to call
+    explicitly and early (train_save_script21.py does, since its own
+    pre-preprocessing row-filtering logic reads salevalue/
+    record_creation_date/vazipcode/Specialty Item before fit()/transform()
+    ever run).
+    """
+    # Detect genuine collisions: two DIFFERENT incoming columns that would land
+    # on the same final name after renaming. Chained renames (e.g. incoming
+    # 'vehicle_category' -> 'body_type' AND incoming 'body_type' -> 'oem_body_style')
+    # are NOT collisions — pandas .rename() maps off the original column names
+    # simultaneously, so both resolve to distinct final names. Only flag it when
+    # the resulting column list would actually have a duplicate.
+    final_names = [NEW_TO_OLD_SCHEMA_MAP.get(c, c) for c in df.columns]
+    seen, dupes = set(), set()
+    for final in final_names:
+        if final in seen:
+            dupes.add(final)
+        seen.add(final)
+    if dupes:
+        offenders = {
+            final: [orig for orig, f in zip(df.columns, final_names) if f == final]
+            for final in dupes
+        }
+        raise ValueError(
+            f"map_raw_features_to_legacy: multiple incoming columns would collide onto "
+            f"the same legacy column name after renaming — refusing to guess which is "
+            f"authoritative: {offenders}. Drop or rename one of each group first."
+        )
+
+    df = df.rename(columns=NEW_TO_OLD_SCHEMA_MAP)
+
+    if "record_creation_date" in df.columns:
+        df["record_creation_date"] = df["record_creation_date"].apply(_normalize_date_value)
+
+    return df
+
+
+def map_raw_features_to_legacy_record(record: dict) -> dict:
+    """Rename a single request dict's keys from the new schema to the legacy
+    schema. Same mapping as map_raw_features_to_legacy, for a single-row
+    dict rather than a DataFrame (not currently needed by app/inference_*.py,
+    which builds a DataFrame directly and relies on _basic_clean()'s
+    automatic call to map_raw_features_to_legacy() instead — kept for
+    parity/for any future single-dict caller)."""
+    renamed = {NEW_TO_OLD_SCHEMA_MAP.get(k, k): v for k, v in record.items()}
+    if "record_creation_date" in renamed:
+        renamed["record_creation_date"] = _normalize_date_value(renamed["record_creation_date"])
+    return renamed
+
+
+# ============================================================
 # SEVERITY MAPS
 # ============================================================
 def _norm_key(s): return s.strip().lower() if isinstance(s, str) else s
 def _norm_dict(d): return {_norm_key(k): v for k, v in d.items()}
 
+
+# Each dict below carries BOTH the legacy text-label keys (script17 / current
+# live inference, which still send resolved *_name text) AND the matching
+# new-schema numeric picklist-ID keys (script21 training, post schema_adapter
+# rename) -- same severity value either way, since the ID keys were built by
+# combining the confirmed ID<->name correspondence with the text severities
+# already below, NOT from raw ID magnitude (the IDs are not ordinal).
+# _norm_dict/_norm_key leave non-string keys untouched, so int keys coexist
+# safely with the lowercased string keys in the same dict.
 NAV_CONDITION_SEV = _norm_dict({
     'Runs & Drives': 0, 'Runs & Moves / Don\u2019t Drive': 1,
     'Runs / Doesn\u2019t Move': 2, 'Cranks, won\u2019t start': 3,
     'Doesn\u2019t Run / Can be Moved': 4, 'Doesn\u2019t Run / Doesn\u2019t Move': 5, 'Unknown': 6,
+    # vehicle_cond_picklist_id (new schema)
+    22968: 0, 22971: 1, 22969: 2, 22974: 3, 22973: 4, 22972: 5, 22970: 6,
 })
 BODY_SEV = _norm_dict({
     'Normal Wear & Tear (all body panels intact & attached)': 0,
     'Some Mirrors, Glass, or Lights are Cracked/Missing': 1,
     'Loose or Missing Panels*': 2, 'Baseball-sized or Larger Damage*': 3,
     'Major Damage*': 4, 'Unknown': 5,
+    # body_paint_cond_picklist_id (new schema)
+    23044: 0, 23046: 1, 23049: 2, 23047: 3, 23048: 4, 23045: 5,
 })
 ENGINE_SEV = _norm_dict({
     'Operational': 0, 'Minor Issues / Still Functional': 1, 'Rebuilt/Replaced': 1,
     'Major Malfunction / Still Installed': 3, 'Missing': 4, 'Removed': 4, 'Unknown': 5,
+    # engine_cond_picklist_id (new schema)
+    23053: 0, 23055: 1, 23056: 1, 23057: 3, 23054: 4, 23058: 4, 23059: 5,
 })
-TRANS_SEV = ENGINE_SEV
+# Same 7 text labels as ENGINE_SEV, but its own dict now -- the transmission
+# picklist-ID block (23060-23066) is disjoint from engine's (23053-23059),
+# and engine/transmission flip which label is "Removed" vs "Missing" at the
+# ID level, so the two can no longer share one dict object once ID keys are
+# involved (they could when only text labels were shared).
+TRANS_SEV = _norm_dict({
+    'Operational': 0, 'Minor Issues / Still Functional': 1, 'Rebuilt/Replaced': 1,
+    'Major Malfunction / Still Installed': 3, 'Missing': 4, 'Removed': 4, 'Unknown': 5,
+    # transmission_cond_picklist_id (new schema)
+    23060: 0, 23061: 1, 23062: 1, 23063: 3, 23064: 4, 23065: 4, 23066: 5,
+})
 TIRE_SEV = _norm_dict({
     'All Wheels Mounted & Tires Inflated': 0, '1 or More Tires are Flat*': 2,
     '1 or More Wheels are Removed*': 3, 'Major Malfunction / Still Installed': 3,
     'Missing': 4, 'Removed': 4, 'Unknown': 5,
+    # tire_cond_picklist_id (new schema) -- note the "good" value (0) is the
+    # HIGHEST id (23073) here, reversed relative to every other condition col.
+    23073: 0, 23072: 2, 23071: 3, 23070: 3, 23069: 4, 23068: 4, 23067: 5,
 })
 INTERIOR_SEV = _norm_dict({
     'Normal Wear & Tear (all interior intact & attached)': 0,
     'Damaged or Removed Parts (notes required)': 2, 'Unknown': 4,
+    # interior_cond_picklist_id (new schema)
+    23050: 0, 23051: 2, 23052: 4,
 })
 DSRATING_NUM = _norm_dict({'DS1-1': 1, 'DS1-2': 2, 'DS1-3': 3, 'DS1-4': 4, 'DS1-5': 5, 'DS3': 6})
 SEV_COLS = [
@@ -246,6 +423,158 @@ SEV_COLS = [
 ]
 UNKNOWN_FLAG_COLS = ['nav_condition','bodypaintcondition','enginecondition',
                      'transmissioncondition','tirecondition','interiorcondition']
+
+# IDs whose resolved name contains "Runs" (vehicle_cond_picklist_id) -- used
+# by _is_runs_condition() below as the numeric-ID counterpart of the legacy
+# text substring check on nav_condition.
+RUNS_CONDITION_IDS = {22968, 22969, 22971}
+
+# Per-column "Unknown" picklist ID -- each condition column has its own ID
+# space, so this can't be a single shared value like the text 'unknown' was.
+UNKNOWN_CONDITION_IDS = {
+    'nav_condition':         22970,
+    'bodypaintcondition':    23045,
+    'enginecondition':       23059,
+    'transmissioncondition': 23066,
+    'tirecondition':         23067,
+    'interiorcondition':     23052,
+}
+
+# ============================================================
+# PICKLIST ID -> DISPLAY NAME (human-readable contexts only: the Granite
+# LLM prompt's car-summary line and the SHAP "value" shown to the user --
+# NOT used by feature engineering above, which only needs severity numbers).
+# Same confirmed ID<->name correspondence as the *_SEV dicts' ID keys, just
+# inverted for text output instead of a severity number. Kept as separate,
+# explicit dicts rather than derived from *_SEV (multiple IDs can share one
+# severity, e.g. ENGINE_SEV's 23055/23056 both -> 1, so severity alone can't
+# be inverted back to a unique name).
+#
+# State fields (state_title_picklist/state_picklist_id) have no equivalent
+# dict here: their ID<->name mapping is only partially known (the ~59 middle
+# IDs were never confirmed -- see the original mapping notes), so a raw
+# numeric ID displays as-is for those two.
+NAV_CONDITION_ID_TO_NAME = {
+    22968: 'Runs & Drives', 22971: 'Runs & Moves / Don’t Drive',
+    22969: 'Runs / Doesn’t Move', 22974: 'Cranks, won’t start',
+    22973: 'Doesn’t Run / Can be Moved', 22972: 'Doesn’t Run / Doesn’t Move',
+    22970: 'Unknown',
+}
+BODY_PAINT_COND_ID_TO_NAME = {
+    23044: 'Normal Wear & Tear (all body panels intact & attached)',
+    23046: 'Some Mirrors, Glass, or Lights are Cracked/Missing',
+    23049: 'Loose or Missing Panels*', 23047: 'Baseball-sized or Larger Damage*',
+    23048: 'Major Damage*', 23045: 'Unknown',
+}
+ENGINE_COND_ID_TO_NAME = {
+    23053: 'Operational', 23055: 'Rebuilt/Replaced',
+    23056: 'Minor Issues / Still Functional',
+    23057: 'Major Malfunction / Still Installed',
+    23054: 'Removed', 23058: 'Missing', 23059: 'Unknown',
+}
+TRANSMISSION_COND_ID_TO_NAME = {
+    23060: 'Operational', 23061: 'Rebuilt/Replaced',
+    23062: 'Minor Issues / Still Functional',
+    23063: 'Major Malfunction / Still Installed',
+    23064: 'Removed', 23065: 'Missing', 23066: 'Unknown',
+}
+TIRE_COND_ID_TO_NAME = {
+    23073: 'All Wheels Mounted & Tires Inflated', 23072: '1 or More Tires are Flat*',
+    23071: '1 or More Wheels are Removed*', 23070: 'Major Malfunction / Still Installed',
+    23069: 'Removed', 23068: 'Missing', 23067: 'Unknown',
+}
+INTERIOR_COND_ID_TO_NAME = {
+    23050: 'Normal Wear & Tear (all interior intact & attached)',
+    23051: 'Damaged or Removed Parts (notes required)', 23052: 'Unknown',
+}
+
+# raw_key (as used by app/raw_feature_mapping.py's EXACT_MAP / INTERNAL_TO_REQUEST_FIELD)
+# -> its ID_TO_NAME dict. other_damages is deliberately absent here -- it's
+# decoded via SaleValuePreprocessor.OTHER_DAMAGE_ID_TO_LABEL instead, since
+# that field can hold a list of IDs, not just one.
+CONDITION_ID_TO_NAME_BY_RAW_KEY = {
+    'nav_condition':         NAV_CONDITION_ID_TO_NAME,
+    'bodypaintcondition':    BODY_PAINT_COND_ID_TO_NAME,
+    'enginecondition':       ENGINE_COND_ID_TO_NAME,
+    'transmissioncondition': TRANSMISSION_COND_ID_TO_NAME,
+    'tirecondition':         TIRE_COND_ID_TO_NAME,
+    'interiorcondition':     INTERIOR_COND_ID_TO_NAME,
+}
+
+
+def describe_picklist_value(raw_key, value):
+    """Decode a numeric picklist ID to its human-readable name for display
+    (LLM prompts, SHAP "value" fields) -- NOT used by feature engineering,
+    which works directly off the ID via the *_SEV dicts above.
+
+    Returns `value` unchanged when raw_key isn't a condition column, the
+    value isn't numeric (e.g. it's already legacy text), or the ID isn't
+    recognized -- so this is always safe to call speculatively.
+    """
+    id_to_name = CONDITION_ID_TO_NAME_BY_RAW_KEY.get(raw_key)
+    if id_to_name is None or value is None:
+        return value
+    if isinstance(value, str):
+        return value  # already text (legacy caller) -- nothing to decode
+    try:
+        return id_to_name.get(int(value), value)
+    except (TypeError, ValueError):
+        return value
+
+
+def describe_other_damages_value(value):
+    """Decode other_damages' display value: a scalar numeric picklist ID, or
+    a list of them (live multi-select), to comma-joined label text via
+    SaleValuePreprocessor.OTHER_DAMAGE_ID_TO_LABEL. Text/JSON-string legacy
+    values and anything unrecognized pass through unchanged -- safe to call
+    speculatively, same convention as describe_picklist_value above.
+    """
+    id_to_label = SaleValuePreprocessor.OTHER_DAMAGE_ID_TO_LABEL
+    if value is None:
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return id_to_label.get(int(value), value)
+        except (TypeError, ValueError):
+            return value
+    if isinstance(value, list):
+        labels = []
+        for item in value:
+            if isinstance(item, (int, float)):
+                labels.append(id_to_label.get(int(item), str(item)))
+            elif isinstance(item, dict):
+                labels.append(str(item.get('name', item)))
+            else:
+                labels.append(str(item))
+        return ', '.join(labels) if labels else value
+    return value  # already text/JSON string -- leave as-is
+
+
+def _is_runs_condition(v):
+    """True for the legacy text label (post-_normalize_text lowercasing, so
+    a plain substring check) and for the new-schema numeric picklist ID
+    (vehicle_cond_picklist_id) whose resolved name contains 'Runs'."""
+    if pd.isna(v):
+        return False
+    if isinstance(v, str):
+        return 'runs' in v
+    try:
+        return int(v) in RUNS_CONDITION_IDS
+    except (TypeError, ValueError):
+        return False
+
+def _is_unknown_condition(v, unknown_id):
+    """True for the legacy text label 'unknown' and for the new-schema
+    numeric picklist ID equal to this column's own Unknown ID
+    (see UNKNOWN_CONDITION_IDS -- each condition column has a different one)."""
+    if pd.isna(v):
+        return False
+    if isinstance(v, str):
+        return v == 'unknown'
+    try:
+        return int(v) == unknown_id
+    except (TypeError, ValueError):
+        return False
 
 # ============================================================
 # PREPROCESSOR — same as Script 20/21
@@ -567,6 +896,20 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                                       'wont pass smog']),
     ]
 
+    # other_damage_pklist_id (new schema) -> canonical label. Decoded by
+    # _extract_tokens() below (scalar ID, or numeric IDs inside a live-request
+    # list) into the same label text _normalize_damage_token() already knows
+    # how to reduce to the tokens above -- e.g. 23074 -> 'Mold' -> 'mold'.
+    OTHER_DAMAGE_ID_TO_LABEL = {
+        23074: 'Mold',
+        23075: 'Flood Damage',
+        23076: 'Fire Damage',
+        23077: 'Air Bag(s) Deployed',
+        23078: "Won't Pass Smog/State Inspection",
+        23079: 'Severe Undercarriage Rust',
+        23080: 'Other*',
+    }
+
     @staticmethod
     def _normalize_damage_token(t):
         """Lowercase, ASCII-fy quotes, collapse whitespace, strip trailing punct.
@@ -629,20 +972,41 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         import json as _json
         raw = X['other_damages']
 
+        def _decode_damage_id(it):
+            """Resolve one other_damage_pklist_id (new schema, numeric) to its
+            canonical label via OTHER_DAMAGE_ID_TO_LABEL, or '' if unrecognized."""
+            try:
+                return self.OTHER_DAMAGE_ID_TO_LABEL.get(int(it), '')
+            except (TypeError, ValueError):
+                return ''
+
         def _extract_tokens(v):
             """Return list of normalized damage type strings from one cell."""
             if v is None or (isinstance(v, float) and pd.isna(v)):
                 return []
+            # New schema: a bare numeric picklist ID (other_damage_pklist_id)
+            # instead of the resolved *_name text -- decode it to the same
+            # label text the *_name column used to carry.
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                label = _decode_damage_id(v)
+                return [self._normalize_damage_token(label)] if label else []
             # A live API request can send other_damages as an actual JSON list
             # (e.g. ["Mold", "Rust"]) rather than the training data's string
             # formats. Handle that BEFORE the str(v) conversion below, since
             # str(["Mold"]) -> "['Mold']" (Python repr, not JSON) would fail
             # the JSON branch and get mangled by the plain-text comma-split
-            # fallback instead. Accepts a list of plain strings or a list of
-            # {'name': ...} dicts, matching the existing JSON-object format.
+            # fallback instead. Accepts a list of plain strings, a list of
+            # {'name': ...} dicts (existing JSON-object format), or a list of
+            # numeric picklist IDs (new schema multi-select).
             if isinstance(v, list):
-                names = [it.get('name', '') if isinstance(it, dict) else str(it)
-                          for it in v]
+                names = []
+                for it in v:
+                    if isinstance(it, dict):
+                        names.append(it.get('name', ''))
+                    elif isinstance(it, (int, float, np.integer, np.floating)):
+                        names.append(_decode_damage_id(it))
+                    else:
+                        names.append(str(it))
                 return [self._normalize_damage_token(n) for n in names if n]
             s = str(v).strip()
             if not s or s.lower() in ('nan', 'none', 'null'):
@@ -710,6 +1074,17 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         return X
 
     def _basic_clean(self, X):
+        # Step 0: normalize new-DB-schema column names onto the legacy names
+        # the rest of this method (and the caller-supplied extra_drop_cols/
+        # TARGET_ENC_COLS/etc. below) is written against. No-op if X is
+        # already legacy-schema or was already renamed by the caller (e.g.
+        # train_save_script21.py calls this early too, for its own
+        # pre-preprocessing row filtering). This is what lets
+        # app/inference_script21.py hand this class a DataFrame built
+        # straight from the new-schema PredictRequest fields with zero
+        # translation step of its own.
+        X = map_raw_features_to_legacy(X)
+
         # Step 1: coalesce paired (nav_*, primary) columns. Prefer nav_*, fall
         # back to the primary field. The unified value lives in the primary
         # column. After coalesce both source columns become equivalent so we
@@ -824,7 +1199,7 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             age_safe = X['age'].replace(0, np.nan) if 'age' in X.columns else np.nan
             X['miles_per_year'] = X['mileage'] / age_safe
         if 'nav_condition' in X.columns:
-            X['runs_flag'] = X['nav_condition'].fillna('').str.contains('runs').astype(int)
+            X['runs_flag'] = X['nav_condition'].map(_is_runs_condition).astype(int)
         else:
             X['runs_flag'] = 0
         for src_col, sev_map, new_col in SEV_COLS:
@@ -832,8 +1207,10 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
                 X[new_col] = X[src_col].map(sev_map).fillna(-1).astype(int)
         unk_cols_present = [c for c in UNKNOWN_FLAG_COLS if c in X.columns]
         if unk_cols_present:
-            unk = pd.DataFrame({c: X[c].fillna('').eq('unknown').astype(int)
-                                for c in unk_cols_present})
+            unk = pd.DataFrame({
+                c: X[c].map(lambda v, _uid=UNKNOWN_CONDITION_IDS[c]: _is_unknown_condition(v, _uid)).astype(int)
+                for c in unk_cols_present
+            })
             X['n_unknowns']  = unk.sum(axis=1)
             X['all_unknown'] = (unk.sum(axis=1) == len(unk_cols_present)).astype(int)
             X['any_unknown'] = (unk.sum(axis=1) > 0).astype(int)

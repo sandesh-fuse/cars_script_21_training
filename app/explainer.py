@@ -35,6 +35,9 @@ from typing import Dict, Optional, List
 
 import logging
 
+from app.raw_feature_mapping import INTERNAL_TO_REQUEST_FIELD
+from preprocessor import describe_picklist_value
+
 logger = logging.getLogger("car-sale-value-predictor")
 
 
@@ -173,7 +176,20 @@ def _build_prompt(
         "nav_condition",
         "vehicle_type",
     ]:
+        # request_dict uses the CURRENT PredictRequest field names, which
+        # differ from body_type/nav_condition (kept here as the internal/
+        # legacy names for this loop) since the new-schema migration --
+        # fall back to the renamed request field via the same alias
+        # app/raw_feature_mapping.py uses.
         val = request_dict.get(field)
+        if val is None:
+            request_field = INTERNAL_TO_REQUEST_FIELD.get(field)
+            if request_field:
+                val = request_dict.get(request_field)
+        # Decode a numeric picklist ID (e.g. 22968) to its display name
+        # ("Runs & Drives") so it reads naturally to the LLM instead of as
+        # an opaque code -- safe no-op for every other field.
+        val = describe_picklist_value(field, val)
         if val is not None and str(val).strip() not in ("", "nan"):
             car_summary_parts.append(f"{field}={val}")
     car_summary = (

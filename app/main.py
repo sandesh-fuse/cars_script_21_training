@@ -110,12 +110,22 @@ async def add_request_id_middleware(request: Request, call_next):
 # Security / Data Scrubbing
 # ==========================================
 def _mask_sensitive_data(payload: dict) -> dict:
-    """Masks sensitive fields before logging raw request bodies."""
+    """Masks sensitive fields before logging raw request bodies.
+
+    Checks both "zip" (current PredictRequest field name) and "vazipcode"
+    (its legacy name, pre-migration): this runs on the raw, unvalidated
+    JSON body in exception-handler logging paths (see below), which can
+    still be a not-yet-migrated caller's payload -- one using the old field
+    name would fail Pydantic validation (extra="forbid") and have its raw
+    body logged right here, so both keys need masking to avoid a PII leak
+    in the warning log during the transition.
+    """
     if not isinstance(payload, dict):
         return payload
     safe_payload = payload.copy()
-    if "vazipcode" in safe_payload and safe_payload["vazipcode"]:
-        safe_payload["vazipcode"] = "*****"
+    for zip_key in ("zip", "vazipcode"):
+        if zip_key in safe_payload and safe_payload[zip_key]:
+            safe_payload[zip_key] = "*****"
     return safe_payload
 
 

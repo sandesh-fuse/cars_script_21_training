@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
-from preprocessor import compute_cult_flag, cpi_ratio_arr, deflate_pred
+from preprocessor import compute_cult_flag, cpi_ratio_arr, deflate_pred, map_raw_features_to_legacy
 from app.shap_utils import compute_user_shap_payload
 
 QUANTILE_LABELS = ["q05", "q50", "q95"]
@@ -66,6 +66,15 @@ class Script21Pipeline:
         explain: bool = False,
     ):
         df = pd.DataFrame([request_dict])
+        # request_dict uses the CURRENT PredictRequest field names (new
+        # DB schema); rename onto the legacy names this method's own direct
+        # column access (cpi_ratio_arr(df) below, the date-injection check
+        # right here) is written against. pre.transform() further down would
+        # apply this same rename internally anyway (preprocessor.py's
+        # _basic_clean() calls it automatically), but that happens on an
+        # internal copy AFTER this point -- this method needs it renamed
+        # up front since it reads `df` directly too, not just via pre.
+        df = map_raw_features_to_legacy(df)
         # app/main.py now sends exclude_none=False (every declared field
         # present, None when the caller omitted it) specifically so every
         # raw column preprocessor.py expects exists here -- but a Python

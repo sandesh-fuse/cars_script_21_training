@@ -18,6 +18,8 @@ provenance for debugging.
 
 from typing import List, Dict, Any, Optional
 
+from preprocessor import describe_picklist_value, describe_other_damages_value
+
 
 # ============================================================
 # MAPPING TABLE
@@ -212,6 +214,31 @@ SUFFIX_RULES = [
 # existing feature_descriptions humanizer so we don't drift.
 from app.feature_descriptions import HUMAN_READABLE
 
+# Internal/engineered raw-feature name (as used above, and in preprocessor.py's
+# feature_cols_) -> the PredictRequest field name it's actually sourced from
+# at request time. preprocessor.py's _basic_clean() renames these new-schema
+# request fields onto the legacy internal names before feature engineering
+# (see NEW_TO_OLD_SCHEMA_MAP in preprocessor.py), so the raw VALUE to show
+# the user (below) must be looked up under the REQUEST's field name, not the
+# internal one, wherever they now differ.
+INTERNAL_TO_REQUEST_FIELD: Dict[str, str] = {
+    'nav_condition':          'vehicle_cond_picklist_id',
+    'bodypaintcondition':     'body_paint_cond_picklist_id',
+    'enginecondition':        'engine_cond_picklist_id',
+    'transmissioncondition':  'transmission_cond_picklist_id',
+    'tirecondition':          'tire_cond_picklist_id',
+    'interiorcondition':      'interior_cond_picklist_id',
+    'other_damages':          'other_damage_pklist_id',
+    'nav_color':              'color',
+    'body_type':              'vehicle_category',
+    'vazipcode':              'zip',
+    'vstate_name':            'state_picklist_id',
+    'state_province_of_title': 'state_title_picklist',
+    'all_clean_notes':        'comment',
+    'accessiblefortwotruck':  'accessible_for_tow_truck',
+    'locatedatdonationca':    'located_at_donation_c_a',
+}
+
 
 def _resolve_raw(engineered_name: str) -> tuple:
     """Resolve an engineered feature name to (raw_key, user_label).
@@ -308,9 +335,30 @@ def collapse_engineered_to_raw(
 
             if group_key not in groups:
                 # Try to pull the raw value from the original request body.
+                # request_dict uses the CURRENT PredictRequest field names,
+                # which differ from raw_key (the internal/engineered name)
+                # for fields renamed by the new-schema migration -- fall back
+                # to INTERNAL_TO_REQUEST_FIELD's alias when the internal name
+                # itself isn't a key in request_dict.
                 raw_val = None
-                if raw_key and raw_key in request_dict:
-                    raw_val = _format_value(request_dict[raw_key])
+                if raw_key:
+                    val = None
+                    if raw_key in request_dict:
+                        val = request_dict[raw_key]
+                    else:
+                        request_field = INTERNAL_TO_REQUEST_FIELD.get(raw_key)
+                        if request_field and request_field in request_dict:
+                            val = request_dict[request_field]
+                    if val is not None:
+                        # Decode a numeric picklist ID to its display name
+                        # (e.g. 22968 -> "Runs & Drives") for condition/damage
+                        # raw keys -- safe no-op for every other raw_key or
+                        # an already-text value (legacy caller).
+                        if raw_key == 'other_damages':
+                            val = describe_other_damages_value(val)
+                        else:
+                            val = describe_picklist_value(raw_key, val)
+                        raw_val = _format_value(val)
 
                 groups[group_key] = {
                     'feature_raw_key':  raw_key or r['feature'],

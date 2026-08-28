@@ -38,8 +38,8 @@ from preprocessor import (
     TARGET_COL, TIME_COL,
     build_cult_lookup, build_zip_lookup, compute_cult_flag,
     cpi_ratio_arr, adjust_target, deflate_pred,
+    map_raw_features_to_legacy,
 )
-from schema_adapter import map_raw_features_to_legacy, filter_to_known_columns
 from shap_dollar_helper import sanity_check_shap
 from _save_predictions_helper import build_predictions_frame, save_predictions
 from evaluate_predictions import evaluate
@@ -47,8 +47,8 @@ from evaluate_predictions import evaluate
 # ============================================================
 # CONFIG
 # ============================================================
-DATA_PATH        = "../../data/June10_donation_cars_sales_nhtsa_enriched_remove_specialty_data.csv"
-CULT_PATH        = "../../data/cult_cars.xlsx"
+DATA_PATH        = "./taegram_all_table_merged_2018_2026.csv"
+CULT_PATH        = "./cult_cars.xlsx"
 ARTIFACTS_DIR    = "./artifacts/script21"
 TRAIN_CUTOFF     = "2018-01-01"
 SEED             = 42
@@ -64,13 +64,15 @@ STANDARD_CONFIG = {
     'use_macro': True, 'use_geo': True, 'use_cult': False,
 }
 
-# DataOne-sourced vehicle spec features. Resolved via schema_adapter's
+# DataOne-sourced vehicle spec features. Resolved via preprocessor.py's
 # NEW_TO_OLD_SCHEMA_MAP to the LEGACY column name the preprocessor actually
 # sees (raw incoming DB field name -> legacy name in the comments below).
 # Gated by the --use-dataone CLI flag (see main()): when OFF (default) these
-# are excluded via SaleValuePreprocessor(extra_drop_cols=...); when ON they
-# flow through untouched. script21-only: preprocessor.py's shared class
-# defaults (used by script17 too) are unaffected either way.
+# are excluded from the CSV read entirely (see DATAONE_RAW_SOURCE_COLS /
+# SCRIPT21_RAW_COLUMNS below) AND via SaleValuePreprocessor(extra_drop_cols=...)
+# as a second guard; when ON they're read and flow through untouched.
+# script21-only: preprocessor.py's shared class defaults (used by script17
+# too) are unaffected either way.
 DATAONE_FEATURES = [
     'oem_body_style',       # raw 'body_type'          -> legacy 'oem_body_style'
     'drive_type',           # raw 'drive_type'         -> legacy 'drive_type' (no rename)
@@ -82,6 +84,35 @@ DATAONE_FEATURES = [
     'msrp',                 # raw 'msrp'               -> legacy 'msrp' (no rename)
     'transmission_name',    # raw 'transmissions_name' -> legacy 'transmission_name'
     'us_style_name',        # raw 'us_styles'          -> legacy 'us_style_name'
+]
+
+# The RAW (new-schema) source column names behind DATAONE_FEATURES above,
+# i.e. what actually needs to be in `usecols=` for --use-dataone to have
+# anything to work with. Order matches DATAONE_FEATURES.
+DATAONE_RAW_SOURCE_COLS = [
+    'body_type', 'drive_type', 'engines_name', 'ice_block_type',
+    'ice_cylinders', 'ice_displacement', 'ice_max_hp', 'msrp',
+    'transmissions_name', 'us_styles',
+]
+
+# Raw (new-schema) columns script21 training reads from the taegram export,
+# matching notebooks/eda.ipynb's reference column list minus every resolved
+# `_name` sibling (the numeric `_id`/`_picklist` column is the source of
+# truth now -- see preprocessor.py's NEW_TO_OLD_SCHEMA_MAP and its merged
+# text+ID severity dicts). Applied as `usecols=` when reading DATA_PATH (see
+# main()), unioned with DATAONE_RAW_SOURCE_COLS when --use-dataone is passed
+# -- so by default nothing outside this list, in particular the resolved
+# *_name text columns, ever reaches the pipeline.
+SCRIPT21_RAW_COLUMNS = [
+    'vin_hin_no', 'make', 'model', 'year', 'trim', 'vehicle_category',
+    'body_subtype', 'color', 'mileage',
+    'vehicle_cond_picklist_id', 'engine_cond_picklist_id',
+    'transmission_cond_picklist_id', 'body_paint_cond_picklist_id',
+    'interior_cond_picklist_id', 'tire_cond_picklist_id',
+    'other_damage_pklist_id',
+    'state_title_picklist', 'state_picklist_id',
+    'zip', 'located_at_donation_c_a', 'accessible_for_tow_truck',
+    'speciality_item', 'sale_value', 'creation_datetime', 'comment',
 ]
 
 DEFAULT_PARAMS_CULT = {
@@ -426,10 +457,19 @@ def main():
     start_t = time.time()
 
     print(f"\nLoading training data from {args.data}...")
-    df = pd.read_csv(args.data, low_memory=False)
-
-    print("Dropping columns not recognized by the schema adapter (DB noise/metadata)...")
-    df = filter_to_known_columns(df)
+    # Restrict the read itself to the requested feature whitelist (matches
+    # notebooks/eda.ipynb's usecols pattern) -- cheaper than reading the
+    # full ~267-column export and filtering after, and replaces the old
+    # filter_to_known_columns() post-read step entirely (no schema_adapter.py
+    # dependency needed). Unioned with DATAONE_RAW_SOURCE_COLS when
+    # --use-dataone is passed.
+    wanted_cols = SCRIPT21_RAW_COLUMNS + (DATAONE_RAW_SOURCE_COLS if args.use_dataone else [])
+    header = pd.read_csv(args.data, nrows=0).columns
+    usecols = [c for c in wanted_cols if c in header]
+    missing = [c for c in wanted_cols if c not in header]
+    if missing:
+        print(f"Warning: not found in CSV header, skipping: {missing}")
+    df = pd.read_csv(args.data, usecols=usecols, low_memory=False)[usecols]
 
     print("Mapping new database schema to legacy ML schema...")
     df = map_raw_features_to_legacy(df)
