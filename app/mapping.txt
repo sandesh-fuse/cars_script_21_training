@@ -1,0 +1,32 @@
+[
+  {
+    "stock_id": null,
+    "vin": vin_hin_no,
+    "make": make,
+    "model": model,
+    "year": year,
+    "trim": trim,
+    "vehicle_type": vehicle_type,
+    "body_type": vehicle_category,
+    "body_subtype": body_subtype,
+    "mileage": mileage,
+    "nav_condition": vehicle_cond_picklist_id,
+    "nav_color": color,
+    "bodypaintcondition": body_paint_cond_picklist_id,
+    "enginecondition": engine_cond_picklist_id,
+    "transmissioncondition": transmission_cond_picklist_id,
+    "tirecondition": tire_cond_picklist_id,
+    "interiorcondition": interior_cond_picklist_id,
+    "vazipcode": zip,
+    "vstate_name": state_title_picklist,
+    "state_province_of_title": state_picklist_id,
+    "accessiblefortwotruck": accessible_for_tow_truck,
+    "locatedatdonationca": located_at_donation_c_a,
+    "record_creation_date": creation_datetime,
+    "all_clean_notes": comment,
+    "other_damages": other_damage_pklist_id
+  },
+  {
+    speciality_item,sale_value,
+  }
+]
