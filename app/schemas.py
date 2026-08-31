@@ -9,6 +9,28 @@ from pydantic import BaseModel, Field, model_validator, field_validator
 from datetime import datetime, timezone
 
 
+# Fields whose real contract is "a numeric picklist ID" -- the deployed
+# script21 model has no learned encoding for genuine text on any of these
+# columns (see each field's own docstring paragraph below for why). Typed
+# Optional[Union[int, float]] below, NOT str, so the schema's own type
+# signature says what it actually expects. _require_numeric_id() still
+# accepts a numeric-looking STRING for caller convenience (e.g. "22968",
+# a common JSON-serialization quirk) and converts it, but rejects genuine
+# resolved text (e.g. "Runs & Drives", "Iowa") with a clear 422 up front --
+# previously that text was silently accepted here and reached XGBoost
+# 3 layers deep inside Script21Pipeline.predict(), which raised an opaque
+# "DataFrame.dtypes ... must be int, float, bool or category" ValueError
+# instead. See project memory script21-vehicle-type-color-picklist-bug for
+# the production incident this was written in response to.
+NUMERIC_PICKLIST_ID_FIELDS = (
+    'vehicle_type', 'color',
+    'vehicle_cond_picklist_id', 'engine_cond_picklist_id',
+    'transmission_cond_picklist_id', 'body_paint_cond_picklist_id',
+    'interior_cond_picklist_id', 'tire_cond_picklist_id',
+    'state_picklist_id', 'state_title_picklist',
+)
+
+
 class PredictRequest(BaseModel):
     """Request body for /predict — all car attribute fields are optional.
 
@@ -76,24 +98,22 @@ class PredictRequest(BaseModel):
     numeric, and preprocessor.py has no bespoke coercion for it (unlike
     zip's regex-extract) — it's a raw DataOne passthrough.
 
-    vehicle_type / color (legacy name: nav_color) are typed as
-    str-or-number: in the taegram training export, these two arrive as
-    unresolved numeric picklist IDs (e.g. 23101.0), not text. vehicle_type
-    is the SAME raw column name in both schemas (no NEW_TO_OLD_SCHEMA_MAP
-    rename needed) and is now in train_save_script21.py's
-    SCRIPT21_RAW_COLUMNS whitelist -- it was excluded from the initial
-    migration's whitelist, which measurably regressed accuracy (it's
-    ~98.5% populated and drives 4 derived interaction features on top of
-    itself), so it was added back; color already arrived as a raw numeric
-    ID even before this migration (no color_name sibling ever existed). The
-    deployed model was trained on those raw numbers, never int-encoded, so
-    at inference time a NUMBER for either field reaches the model as-is and
-    predicts fine; a STRING for either field still reaches the model
-    (nothing rejects it here) but currently makes XGBoost raise a dtype
-    error, because the fitted preprocessor never learned an encoding for
-    string values in these two columns. Known, unfixed (see project
-    memory: script21-vehicle-type-color-picklist-bug) — send a number for
-    these two specifically.
+    vehicle_type / color (legacy name: nav_color) are numeric picklist IDs:
+    in the taegram training export, these two arrive as unresolved numeric
+    picklist IDs (e.g. 23101.0), not text. vehicle_type is the SAME raw
+    column name in both schemas (no NEW_TO_OLD_SCHEMA_MAP rename needed)
+    and is now in train_save_script21.py's SCRIPT21_RAW_COLUMNS whitelist
+    -- it was excluded from the initial migration's whitelist, which
+    measurably regressed accuracy (it's ~98.5% populated and drives 4
+    derived interaction features on top of itself), so it was added back;
+    color already arrived as a raw numeric ID even before this migration
+    (no color_name sibling ever existed). The deployed model was trained on
+    those raw numbers, never int-encoded, so at inference time a number for
+    either field reaches the model as-is and predicts fine. See
+    NUMERIC_PICKLIST_ID_FIELDS / _require_numeric_id above the class for
+    why genuine text is now rejected with a 422 instead of silently
+    reaching XGBoost and crashing there (project memory:
+    script21-vehicle-type-color-picklist-bug).
 
     doors is ALSO typed str-or-number, for a related but distinct reason:
     the raw taegram 'doors' column isn't cleanly numeric across the full
@@ -122,41 +142,49 @@ class PredictRequest(BaseModel):
 
     accessible_for_tow_truck (legacy: accessiblefortwotruck) /
     located_at_donation_c_a (legacy: locatedatdonationca) stay
-    Optional[str] deliberately, NOT bool, even though they're plain
-    true/false flags: both are int-encoded categoricals trained on the
-    STRING keys 'true'/'false' (preprocessor_standard.joblib's int_maps_
-    confirms exactly {'true': 0, 'false': 1} for each). A genuine Python
-    bool lands as `bool` dtype in the single-row DataFrame
-    Script21Pipeline.predict() builds, which preprocessor.py's
-    _normalize_text() silently skips (it only touches object-dtype
-    columns) -- so it would never get lowercased/stringified and would
-    fail to match either trained category, same failure mode
-    vehicle_type/color/doors had before their fixes above. Fixable with a
-    downstream bool->string coercion (considered, deliberately not added)
-    -- until then, keep these Optional[str] and send the literal string
-    "true"/"false".
+    Optional[str], NOT bool, even though they're plain true/false flags:
+    both are int-encoded categoricals trained on the STRING keys
+    'true'/'false' (preprocessor_standard.joblib's int_maps_ confirms
+    exactly {'true': 0, 'false': 1} for each). A genuine Python bool lands
+    as `bool` dtype in the single-row DataFrame Script21Pipeline.predict()
+    builds, which preprocessor.py's _normalize_text() silently skips (it
+    only touches object-dtype columns) -- so it would never get
+    lowercased/stringified and would fail to match either trained category,
+    same failure mode vehicle_type/color/doors had before their fixes
+    above. _require_true_false below now coerces a genuine bool to the
+    literal string "true"/"false" (fixing that silently-wrong case), and
+    rejects anything else that isn't (case-insensitively) "true" or "false"
+    with a clear 422 instead of letting an unrecognized string reach the
+    model as an unseen category.
 
     vehicle_cond_picklist_id / engine_cond_picklist_id /
     transmission_cond_picklist_id / body_paint_cond_picklist_id /
     interior_cond_picklist_id / tire_cond_picklist_id (legacy names:
     nav_condition, enginecondition, transmissioncondition,
-    bodypaintcondition, interiorcondition, tirecondition) are typed
-    str-or-number: the new-schema/primary expected value is the numeric
-    picklist ID, but preprocessor.py's severity dicts (NAV_CONDITION_SEV /
-    BODY_SEV / ENGINE_SEV / TRANS_SEV / TIRE_SEV / INTERIOR_SEV) carry both
-    the numeric-ID keys AND the original text-label keys, built from a
-    confirmed ID<->name correspondence — so a legacy text value (e.g.
-    "Runs & Drives") still resolves to the identical severity as its
-    numeric-ID equivalent (22968) would. Send the numeric ID going
-    forward; text is accepted for backward compatibility, not because it's
-    the preferred format anymore.
+    bodypaintcondition, interiorcondition, tirecondition) require the
+    numeric picklist ID now, enforced by _require_numeric_id above the
+    class. preprocessor.py's severity dicts (NAV_CONDITION_SEV / BODY_SEV /
+    ENGINE_SEV / TRANS_SEV / TIRE_SEV / INTERIOR_SEV) still carry both the
+    numeric-ID keys AND the original text-label keys internally (so a
+    legacy text value would still resolve to the correct severity number
+    if it ever got that far) -- but a raw picklist-ID column is ALSO fed
+    straight through into the final feature matrix as its own feature
+    (alongside whatever's derived from it), and since these columns are
+    numeric-only at fit time under the new schema, there's no learned
+    encoding for text there at all. A resolved-text value (e.g.
+    "Runs & Drives") used to be silently accepted here and crash 3 layers
+    deep in XGBoost instead -- see project memory
+    script21-vehicle-type-color-picklist-bug for the production incident.
+    Rejected here now with a clear 422 instead.
 
     state_title_picklist / state_picklist_id (legacy names:
-    state_province_of_title, vstate_name) are typed str-or-number for the
-    same reason, but with no ordinal meaning to preserve — both are
-    frequency/int-encoded as opaque categoricals either way (see
-    preprocessor.py's FREQ_COLS_BASE), so the raw numeric ID passes
-    straight through exactly as safely as the legacy text used to.
+    state_province_of_title, vstate_name) require the numeric picklist ID
+    for the same reason, but more strictly still: these are opaque,
+    non-ordinal categoricals with no severity-dict-style text fallback at
+    all (see preprocessor.py's FREQ_COLS_BASE) -- a resolved text value
+    like "Iowa" was never correctly encoded here even before it crashed,
+    unlike the condition fields above which at least degrade correctly on
+    text everywhere except the raw passthrough.
     """
 
     # Identifiers
@@ -168,32 +196,79 @@ class PredictRequest(BaseModel):
     model: Optional[str] = None
     year: Optional[int] = None
     trim: Optional[str] = None
-    vehicle_type: Optional[Union[str, int, float]] = None
+    vehicle_type: Optional[Union[int, float]] = None
     vehicle_category: Optional[str] = None  # legacy name: body_type
     body_subtype: Optional[str] = None
     doors: Optional[Union[str, int, float]] = None
     mileage: Optional[float] = None
 
     # Condition & Visual attrs
-    vehicle_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: nav_condition
-    color: Optional[Union[str, int, float]] = None  # legacy name: nav_color
-    body_paint_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: bodypaintcondition
-    engine_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: enginecondition
-    transmission_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: transmissioncondition
-    tire_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: tirecondition
-    interior_cond_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: interiorcondition
+    vehicle_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: nav_condition
+    color: Optional[Union[int, float]] = None  # legacy name: nav_color
+    body_paint_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: bodypaintcondition
+    engine_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: enginecondition
+    transmission_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: transmissioncondition
+    tire_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: tirecondition
+    interior_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: interiorcondition
     other_damage_pklist_id: Optional[Union[str, int, float, List[Any]]] = None  # legacy name: other_damages
     comment: Optional[str] = None  # legacy name: all_clean_notes
 
     # Geo, Admin, and Flags
     zip: Optional[Union[str, int, float]] = None  # legacy name: vazipcode
-    state_picklist_id: Optional[Union[str, int, float]] = None  # legacy name: vstate_name
-    state_title_picklist: Optional[Union[str, int, float]] = None  # legacy name: state_province_of_title
+    state_picklist_id: Optional[Union[int, float]] = None  # legacy name: vstate_name
+    state_title_picklist: Optional[Union[int, float]] = None  # legacy name: state_province_of_title
     accessible_for_tow_truck: Optional[str] = None  # legacy name: accessiblefortwotruck
     located_at_donation_c_a: Optional[str] = None  # legacy name: locatedatdonationca
 
     # Date — defaults to today if not provided
     creation_datetime: Optional[str] = None  # legacy name: record_creation_date
+
+    @field_validator(*NUMERIC_PICKLIST_ID_FIELDS, mode="before")
+    @classmethod
+    def _require_numeric_id(cls, v, info):
+        """Accept a real number, or a numeric-looking string (a common JSON
+        client quirk -- see NUMERIC_PICKLIST_ID_FIELDS above the class),
+        converting either to a float. Reject anything else (genuine
+        resolved text, e.g. "Runs & Drives"/"Iowa") with a clear error
+        instead of letting it through to crash inside XGBoost later."""
+        if v is None:
+            return v
+        if isinstance(v, bool):
+            raise ValueError(f"{info.field_name} must be a numeric picklist ID, not a boolean.")
+        if isinstance(v, (int, float)):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            try:
+                return float(s)
+            except ValueError:
+                raise ValueError(
+                    f"{info.field_name} must be a numeric picklist ID (e.g. 22968), "
+                    f"not resolved text ({v!r}). The deployed model was trained "
+                    "exclusively on numeric picklist IDs for this field and has "
+                    "no encoding for text."
+                )
+        raise ValueError(f"{info.field_name} must be a numeric picklist ID, got {type(v).__name__}.")
+
+    @field_validator("accessible_for_tow_truck", "located_at_donation_c_a", mode="before")
+    @classmethod
+    def _require_true_false(cls, v, info):
+        """The model was trained on exactly the string categories
+        'true'/'false' for these two flags. Coerce a genuine bool to the
+        matching string (fixes a silent-miss case -- see docstring above);
+        reject anything else that isn't (case-insensitively) "true" or
+        "false" instead of letting an unrecognized string reach the model
+        as an unseen category."""
+        if v is None:
+            return v
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+            return v.strip().lower()
+        raise ValueError(
+            f'{info.field_name} must be "true" or "false" (the model was trained '
+            f"on exactly those two string categories), got {v!r}."
+        )
 
     # Unrecognized fields are rejected (422) rather than silently ignored —
     # every field a real request can carry must be declared explicitly above.

@@ -123,13 +123,19 @@ except ImportError:
 # hand-copied -- if schemas.py's field list/types change again, this adapts
 # automatically instead of silently going stale.
 # 'int'/'float'/'str': the field's sole declared type.
-# 'numeric_or_str': a str|int|float|None union (vehicle_type/nav_color --
-#   unresolved taegram picklist IDs the model was trained on as raw numbers,
-#   but the field still accepts real text too). Numeric input must pass
-#   through as a genuine number, NOT get stringified: the fitted
-#   preprocessor never learned an encoding for these two columns as
-#   strings, so e.g. "23101" (str) makes XGBoost reject the column as
+# 'numeric_or_str': a str|int|float|None union -- e.g. other_damage_pklist_id,
+#   which genuinely accepts either representation downstream. Numeric input
+#   must pass through as a genuine number, NOT get stringified: the fitted
+#   preprocessor never learned an encoding for certain picklist-ID columns
+#   as strings, so e.g. "23101" (str) makes XGBoost reject the column as
 #   non-numeric dtype at predict time, while 23101 (number) predicts fine.
+# 'float': int|float|None (no str) -- e.g. vehicle_type/color/the condition
+#   and state picklist-ID fields, now that app/schemas.py's
+#   NUMERIC_PICKLIST_ID_FIELDS validator rejects genuine text for these and
+#   narrowed their type to drop str entirely. Still just a real number, so
+#   the existing 'float' handling below (never stringifies) is exactly
+#   right -- this branch only exists so a 2-arg {int, float} union doesn't
+#   fall through to 'other' and get needlessly stringified again.
 # 'other': anything else multi-type (e.g. other_damages: str | list[str] |
 #   None) -- a list is passed through untouched, since the live parser
 #   handles it natively; everything else stringifies (original behavior).
@@ -148,6 +154,8 @@ def _field_kind(annotation):
         return 'other'
     if set(args) == {str, int, float}:
         return 'numeric_or_str'
+    if set(args) == {int, float}:
+        return 'float'
     return 'other'
 
 
