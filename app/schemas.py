@@ -9,25 +9,35 @@ from pydantic import BaseModel, Field, model_validator, field_validator
 from datetime import datetime, timezone
 
 
-# Fields whose real contract is "a numeric picklist ID" -- the deployed
-# script21 model has no learned encoding for genuine text on any of these
-# columns (see each field's own docstring paragraph below for why). Typed
-# Optional[Union[int, float]] below, NOT str, so the schema's own type
-# signature says what it actually expects. _require_numeric_id() still
-# accepts a numeric-looking STRING for caller convenience (e.g. "22968",
-# a common JSON-serialization quirk) and converts it, but rejects genuine
-# resolved text (e.g. "Runs & Drives", "Iowa") with a clear 422 up front --
+# Fields whose real contract is "a number" -- 9 of these (all but zip) are
+# picklist IDs the deployed script21 model has no learned encoding for as
+# text at all (see each field's own docstring paragraph below for why).
+# Typed Optional[Union[int, float]] below, NOT str, so the schema's own
+# type signature says what it actually expects. _require_numeric_id()
+# still accepts a numeric-looking STRING for caller convenience (e.g.
+# "22968", a common JSON-serialization quirk) and converts it, but rejects
+# genuine text (e.g. "Runs & Drives", "Iowa") with a clear 422 up front --
 # previously that text was silently accepted here and reached XGBoost
 # 3 layers deep inside Script21Pipeline.predict(), which raised an opaque
 # "DataFrame.dtypes ... must be int, float, bool or category" ValueError
 # instead. See project memory script21-vehicle-type-color-picklist-bug for
 # the production incident this was written in response to.
+#
+# zip is grouped in here for a DIFFERENT reason: preprocessor.py's zip
+# handling (.astype(str).str.extract(...), then the raw column is dropped
+# entirely) is already robust to any input shape, including a string --
+# it was never at the same crash risk as the other 9. It's here purely to
+# keep the *contract* unambiguous: a caller must send a real number or an
+# actual JSON null, never a string standing in for one ("", "null", "N/A",
+# ...), which a permissive str|int|float type would otherwise allow through
+# indistinguishably from a genuine numeric zip.
 NUMERIC_PICKLIST_ID_FIELDS = (
     'vehicle_type', 'color',
     'vehicle_cond_picklist_id', 'engine_cond_picklist_id',
     'transmission_cond_picklist_id', 'body_paint_cond_picklist_id',
     'interior_cond_picklist_id', 'tire_cond_picklist_id',
     'state_picklist_id', 'state_title_picklist',
+    'zip',
 )
 
 
@@ -130,15 +140,21 @@ class PredictRequest(BaseModel):
     '<N>.0'-style trained category, same convention as vehicle_type/
     color; a string still passes through unchanged too.
 
-    zip (legacy name: vazipcode) accepts str-or-number too, but for a
-    benign reason (unlike the three above): preprocessor.py's zip handling
-    does `.astype(str).str.extract(r'(\\d{1,5})')` on it regardless of
-    input type, so "52732.0"/52732.0/52732/"52732" all extract to the
-    identical '52732' before being zero-padded and fanned out into
-    zip_region/zip_first2/zip_first3/zip_lat/zip_lon/zip_full_freq
-    (verified). The old Optional[str]-only typing didn't match anything
-    wrong -- it just rejected a caller sending the ZIP as a JSON number
-    with an avoidable 422 before ever reaching that already-robust code.
+    zip (legacy name: vazipcode) requires a numeric value now too (via
+    NUMERIC_PICKLIST_ID_FIELDS / _require_numeric_id), but for a DIFFERENT
+    reason than the picklist-ID fields above: preprocessor.py's zip
+    handling does `.astype(str).str.extract(r'(\\d{1,5})')` on it
+    regardless of input type, so "52732.0"/52732.0/52732/"52732" all
+    extract to the identical '52732' before being zero-padded and fanned
+    out into zip_region/zip_first2/zip_first3/zip_lat/zip_lon/
+    zip_full_freq, then the raw column is dropped entirely -- it was never
+    at crash risk from a string the way the other 9 fields were (verified:
+    even outright garbage like "not-a-zip" degrades gracefully to the "no
+    zip" bucket instead of erroring). It's restricted to numeric here
+    purely to keep the request *contract* unambiguous -- a missing zip
+    must be sent as an actual JSON null, not a string standing in for one
+    ("", "null", "N/A", ...), which the old str|int|float typing would
+    otherwise accept indistinguishably from a genuine numeric zip.
 
     accessible_for_tow_truck (legacy: accessiblefortwotruck) /
     located_at_donation_c_a (legacy: locatedatdonationca) stay
@@ -214,7 +230,7 @@ class PredictRequest(BaseModel):
     comment: Optional[str] = None  # legacy name: all_clean_notes
 
     # Geo, Admin, and Flags
-    zip: Optional[Union[str, int, float]] = None  # legacy name: vazipcode
+    zip: Optional[Union[int, float]] = None  # legacy name: vazipcode
     state_picklist_id: Optional[Union[int, float]] = None  # legacy name: vstate_name
     state_title_picklist: Optional[Union[int, float]] = None  # legacy name: state_province_of_title
     accessible_for_tow_truck: Optional[str] = None  # legacy name: accessiblefortwotruck
@@ -228,13 +244,18 @@ class PredictRequest(BaseModel):
     def _require_numeric_id(cls, v, info):
         """Accept a real number, or a numeric-looking string (a common JSON
         client quirk -- see NUMERIC_PICKLIST_ID_FIELDS above the class),
-        converting either to a float. Reject anything else (genuine
-        resolved text, e.g. "Runs & Drives"/"Iowa") with a clear error
-        instead of letting it through to crash inside XGBoost later."""
+        converting either to a float. Reject anything else -- genuine
+        resolved text (e.g. "Runs & Drives"/"Iowa") for the 9 picklist-ID
+        fields, or a string standing in for null (e.g. "", "null", "N/A")
+        for zip -- with a clear error instead of letting it through to
+        crash inside XGBoost later (or, for zip, silently degrade to the
+        same "no zip" bucket as a real null while claiming to be a value).
+        Message is deliberately generic ("a number", not "a picklist ID")
+        since zip is grouped in here too and isn't one."""
         if v is None:
             return v
         if isinstance(v, bool):
-            raise ValueError(f"{info.field_name} must be a numeric picklist ID, not a boolean.")
+            raise ValueError(f"{info.field_name} must be a number, not a boolean.")
         if isinstance(v, (int, float)):
             return v
         if isinstance(v, str):
@@ -243,12 +264,9 @@ class PredictRequest(BaseModel):
                 return float(s)
             except ValueError:
                 raise ValueError(
-                    f"{info.field_name} must be a numeric picklist ID (e.g. 22968), "
-                    f"not resolved text ({v!r}). The deployed model was trained "
-                    "exclusively on numeric picklist IDs for this field and has "
-                    "no encoding for text."
+                    f"{info.field_name} must be a number (e.g. 22968), not text ({v!r})."
                 )
-        raise ValueError(f"{info.field_name} must be a numeric picklist ID, got {type(v).__name__}.")
+        raise ValueError(f"{info.field_name} must be a number, got {type(v).__name__}.")
 
     @field_validator("accessible_for_tow_truck", "located_at_donation_c_a", mode="before")
     @classmethod
