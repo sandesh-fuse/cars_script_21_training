@@ -1011,6 +1011,19 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
             s = str(v).strip()
             if not s or s.lower() in ('nan', 'none', 'null'):
                 return []
+            # New schema: a bare numeric picklist ID sent as a JSON STRING
+            # (e.g. "23080") rather than a number -- other_damage_pklist_id's
+            # declared type (Union[str, int, float, List[Any]], see
+            # app/schemas.py) explicitly allows str, and a JSON client can
+            # legitimately serialize a numeric ID as a string. Decode it the
+            # same way as the numeric branch above, BEFORE falling into the
+            # JSON/plain-text parsing below -- otherwise a stringified ID
+            # gets treated as freeform text (a bogus damage-type token
+            # instead of its real label), silently diverging from what the
+            # identical value would produce as an actual int/float.
+            if s.lstrip('-').isdigit():
+                label = _decode_damage_id(s)
+                return [self._normalize_damage_token(label)] if label else []
             # JSON-encoded list of {'id': ..., 'name': ...} dicts
             if s.startswith('['):
                 try:

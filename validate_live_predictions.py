@@ -19,14 +19,14 @@ recorded alongside them. Two modes, selected via --source:
 
 --source full (large, reconstructed, representative -- the default):
     Replays EVERY row of artifacts/script21/test_predictions.csv (12.7k+
-    rows, duplicate stock_ids kept, not deduped -- see build below). Unlike
+    rows, duplicates kept, not deduped -- see build below). Unlike
     sample_test_rows.parquet, test_predictions.csv carries no raw
     car-attribute columns at all -- just
     stock_id/vin/record_creation_date/salevalue/predicted_sale_value/
     p5/p50/p95/abs_error_p50/ci_width/is_cult (see _save_predictions_helper.py's
     build_predictions_frame -- it deliberately keeps only ID + prediction
     output columns). So this mode reconstructs the raw feature row for each
-    stock_id by looking it up in taegram_all_table_merged_2018_2026.csv (a
+    row by looking it up in taegram_all_table_merged_2018_2026.csv (a
     ~930k-row raw DB export in a DIFFERENT column-naming schema than
     app/schemas.py's PredictRequest uses -- e.g. 'zip'/'color'/'sale_value'
     instead of 'vazipcode'/'nav_color'/'salevalue'), then translates it via
@@ -34,16 +34,25 @@ recorded alongside them. Two modes, selected via --source:
     filter_to_known_columns()/map_raw_features_to_legacy() calls
     train_save_script21.py itself makes at training-data-ingestion time).
 
+    Joins on VIN, not stock_id: 'stock_id' is entirely null in
+    test_predictions.csv for script21 -- it was never part of
+    SCRIPT21_RAW_COLUMNS, so train_save_script21.py never read it from the
+    training CSV in the first place. taegram itself does have a real
+    'stock_id' column, but there's nothing on the test_predictions.csv side
+    to join it against, so 'vin' (fully populated on both sides) is what
+    load_taegram_subset()/resolve_raw_row() below actually match on.
+
     CAVEAT specific to this mode: unlike sample mode's exact-echo
     guarantee, a "full" row is a *reconstruction* -- taegram's raw export
     is not guaranteed to be byte-identical to whatever raw_df
     train_save_script21.py originally loaded (from DATA_PATH, a derived
-    file not present in this checkout), and taegram itself has ~11.6k rows
-    sharing a duplicate stock_id, requiring disambiguation (see
-    resolve_raw_row()). So expect live_mae to deviate from stored_mae by
-    more than sample mode's near-zero delta -- that's expected, not
-    necessarily a regression; read the per-row failure_reason/resolve_status
-    columns in the output CSV to see why any given row differs.
+    file not present in this checkout), and a small number of vins are
+    duplicated in taegram (e.g. a car re-donated/re-listed), requiring
+    disambiguation (see resolve_raw_row()). So expect live_mae to deviate
+    from stored_mae by more than sample mode's near-zero delta -- that's
+    expected, not necessarily a regression; read the per-row
+    failure_reason/resolve_status columns in the output CSV to see why any
+    given row differs.
 
 app/schemas.py's PredictRequest is imported directly and used as the actual
 schema for the outgoing request in BOTH modes -- not just as a reference
@@ -98,6 +107,7 @@ from app.schemas import PredictRequest
 from evaluate_predictions import mae
 from preprocessor import TARGET_COL
 from schema_adapter import (
+    NEW_TO_OLD_SCHEMA_MAP,
     filter_to_known_columns,
     known_raw_columns,
     map_raw_features_to_legacy,
@@ -159,6 +169,22 @@ EXCLUDE_FROM_REQUEST = {
 # request if sent, so build_request() filters to this set rather than
 # relying on the server to ignore extras.
 DECLARED_FIELDS = set(PredictRequest.model_fields.keys())
+
+# sample_test_rows.parquet rows (train_save_script21.py's own test_cult_raw/
+# test_std_raw) and full-mode's taegram rows (after apply_schema_adapter()
+# below) are both LEGACY-schema-named (nav_condition, vazipcode, nav_color,
+# state_province_of_title, ...) -- train_save_script21.py itself calls
+# map_raw_features_to_legacy(df) once, early, before every downstream
+# split/slice, so every raw-attribute artifact it saves inherits legacy
+# names. But PredictRequest/DECLARED_FIELDS are NEW-schema-named post
+# migration (vehicle_cond_picklist_id, zip, color, state_title_picklist,
+# ...). map_raw_features_to_legacy() only ever renames NEW -> LEGACY, so
+# without reversing it here, build_request() below would silently drop
+# every renamed field (only passthrough fields like make/model/year/trim/
+# vehicle_type/body_subtype/mileage, whose name is identical in both
+# schemas, would survive) -- NEW_TO_OLD_SCHEMA_MAP's values are all unique,
+# so it inverts cleanly.
+OLD_TO_NEW_SCHEMA_MAP = {legacy: new for new, legacy in NEW_TO_OLD_SCHEMA_MAP.items()}
 
 
 def _clean_value(field, value):
@@ -244,6 +270,12 @@ def build_request(row):
     not declared as a field, so an undeclared raw column has to be dropped
     HERE rather than left for pydantic to reject the whole request over.
     """
+    # row is LEGACY-schema-named (see OLD_TO_NEW_SCHEMA_MAP comment above) --
+    # translate back to the NEW-schema names DECLARED_FIELDS/FIELD_TYPES
+    # actually use before filtering. Series.rename() leaves any index label
+    # not in the map untouched, so passthrough fields (make/model/year/...)
+    # are unaffected.
+    row = row.rename(OLD_TO_NEW_SCHEMA_MAP)
     mapped = {field: _clean_value(field, row[field]) for field in row.index
               if field not in EXCLUDE_FROM_REQUEST and field in DECLARED_FIELDS}
     req = PredictRequest(**mapped)
@@ -328,7 +360,13 @@ def run_sample_mode(args):
     n_call_failed = 0
     n_route_mismatch = 0
     for _, row in sample.iterrows():
-        sid = row['stock_id']
+        # sample_test_rows.parquet has no 'stock_id' column at all --
+        # 'stock_id' was never part of SCRIPT21_RAW_COLUMNS, so it was never
+        # read from the training CSV in the first place (pre-existing gap,
+        # unrelated to the schema-name fix above). Fall back to 'vin' as the
+        # per-row identifier used in progress/error messages and the output
+        # CSV.
+        sid = row.get('stock_id', row.get('vin', '<unknown>'))
 
         try:
             body = build_request(row)
@@ -413,61 +451,74 @@ def run_sample_mode(args):
 
 def load_test_predictions_csv(path):
     """Load artifacts/script21/test_predictions.csv WHOLE, in its original
-    row order, duplicate stock_ids kept as-is -- this is the row list the
-    final output must match 1:1 in count and order (per
+    row order, duplicate rows kept as-is -- this is the row list the final
+    output must match 1:1 in count and order (per
     _save_predictions_helper.build_predictions_frame, it's an ID +
     prediction-output table only: stock_id/vin/record_creation_date +
     salevalue/predicted_sale_value/p5/p50/p95/abs_error_p50/ci_width/is_cult
     -- no raw car-attribute columns, hence the taegram reconstruction
-    below)."""
+    below).
+
+    NOTE: 'stock_id' is entirely null in this file for script21 -- it was
+    never part of SCRIPT21_RAW_COLUMNS (see train_save_script21.py), so
+    build_predictions_frame() never had a real value to put there. 'vin' IS
+    fully populated (confirmed: 0/12736 nulls in the current file), so it's
+    what load_taegram_subset()/resolve_raw_row() below actually join on."""
     df = pd.read_csv(path)
     required = {'stock_id', 'vin', 'salevalue', 'p50', 'abs_error_p50', 'is_cult'}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"{path} is missing expected column(s): {sorted(missing)}")
-    n_dup = len(df) - df['stock_id'].nunique()
+    n_dup = len(df) - df['vin'].nunique()
     print(f"Loaded {len(df)} rows from {path} "
-          f"({df['stock_id'].nunique()} unique stock_ids, {n_dup} duplicate rows kept).")
+          f"({df['vin'].nunique()} unique vins, {n_dup} duplicate rows kept).")
     return df
 
 
-def load_taegram_subset(path, stock_ids, chunksize=100_000):
+def load_taegram_subset(path, target_vins, chunksize=100_000):
     """Read taegram_all_table_merged_2018_2026.csv (~930k rows, ~250 raw
     DB-export columns -- far too much to load whole) and return only the
-    rows whose 'stock_id' is one we actually need, restricted to the
-    columns schema_adapter.py knows how to translate
+    rows whose 'vin_hin_no' (taegram's raw column; renamed to legacy 'vin'
+    by apply_schema_adapter() below) is one we actually need, restricted to
+    the columns schema_adapter.py knows how to translate
     (schema_adapter.known_raw_columns() -- the union of
     NEW_TO_OLD_SCHEMA_MAP keys/values + PredictRequest's declared fields).
     Reading in chunks and filtering each one keeps memory bounded to the
-    matched subset rather than the full 930k-row file."""
+    matched subset rather than the full 930k-row file.
+
+    Joins on VIN, not stock_id: taegram itself does carry a real 'stock_id'
+    column, but script21's own training data never reads it (see
+    load_test_predictions_csv()'s note), so there is nothing on the
+    test_predictions.csv side to join stock_id against."""
     header = pd.read_csv(path, nrows=0).columns.tolist()
     known = known_raw_columns()
     usecols = [c for c in header if c in known]
-    if 'stock_id' not in usecols:
-        raise ValueError(f"'stock_id' column not found in {path} (or not recognized by "
+    if 'vin_hin_no' not in usecols:
+        raise ValueError(f"'vin_hin_no' column not found in {path} (or not recognized by "
                           f"schema_adapter.known_raw_columns()) -- cannot join.")
     print(f"Reading {path}: keeping {len(usecols)}/{len(header)} columns schema_adapter "
-          f"recognizes, filtering to {len(stock_ids)} target stock_ids...")
+          f"recognizes, filtering to {len(target_vins)} target vins...")
 
     chunks = []
     n_seen = 0
     with warnings.catch_warnings():
         # Mixed dtypes within a chunk are expected/harmless here: the only
-        # column this function's own matching logic relies on ('stock_id')
+        # column this function's own matching logic relies on ('vin_hin_no')
         # has its dtype forced above; every other column's per-value type
         # coercion happens later in _clean_value(), which works off
         # individual Python values, not a column's inferred dtype.
         warnings.simplefilter("ignore", pd.errors.DtypeWarning)
-        for chunk in pd.read_csv(path, usecols=usecols, chunksize=chunksize, dtype={'stock_id': str}):
+        for chunk in pd.read_csv(path, usecols=usecols, chunksize=chunksize, dtype={'vin_hin_no': str}):
             n_seen += len(chunk)
-            match = chunk[chunk['stock_id'].isin(stock_ids)]
+            vin_clean = chunk['vin_hin_no'].astype(str).str.strip()
+            match = chunk[vin_clean.isin(target_vins)]
             if len(match):
                 chunks.append(match)
     df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=usecols)
-    n_found = df['stock_id'].nunique() if len(df) else 0
+    n_found = df['vin_hin_no'].astype(str).str.strip().nunique() if len(df) else 0
     print(f"  scanned {n_seen} taegram rows, matched {len(df)} rows for "
-          f"{n_found}/{len(stock_ids)} target stock_ids "
-          f"({len(stock_ids) - n_found} stock_ids have no taegram row at all).")
+          f"{n_found}/{len(target_vins)} target vins "
+          f"({len(target_vins) - n_found} vins have no taegram row at all).")
     return df
 
 
@@ -483,49 +534,36 @@ def apply_schema_adapter(df):
 
 
 def build_taegram_lookup(df):
-    """Group the (already schema-adapted) taegram subset by stock_id for
+    """Group the (already schema-adapted) taegram subset by vin (legacy
+    name -- apply_schema_adapter() already renamed vin_hin_no -> vin) for
     O(1) lookup. Values are lists of pandas Series (not dict records) --
     build_request()/_clean_value() index into row.index, matching a
     sample_test_rows.parquet row's shape exactly."""
-    if 'stock_id' in df.columns:
+    if 'vin' in df.columns:
         df = df.copy()
-        df['stock_id'] = df['stock_id'].astype(str).str.strip()
+        df['vin'] = df['vin'].astype(str).str.strip()
     lookup = {}
-    for sid, group in df.groupby('stock_id', sort=False):
-        lookup[sid] = [row for _, row in group.iterrows()]
+    for vin, group in df.groupby('vin', sort=False):
+        lookup[vin] = [row for _, row in group.iterrows()]
     return lookup
 
 
-def resolve_raw_row(sid, vin, salevalue, taegram_by_stock_id):
+def resolve_raw_row(vin, salevalue, taegram_by_vin):
     """Resolve exactly one taegram raw row for one test_predictions.csv
-    row. taegram itself has ~11.6k rows sharing a duplicate stock_id (out
-    of ~930k), so a stock_id match alone isn't always unique -- disambiguate
-    by vin first (taegram's vin_hin_no -> legacy 'vin'), then by closest
-    'salevalue' (taegram's sale_value -> legacy 'salevalue') if vin doesn't
-    narrow it to exactly one. Every disambiguated/ambiguous case is logged
-    with its stock_id and candidate count -- auditable, not silent.
+    row, by vin. A handful of vins are duplicated in taegram (e.g. the same
+    car re-donated/re-listed), so a vin match alone isn't always unique --
+    disambiguate by closest 'salevalue' (taegram's sale_value -> legacy
+    'salevalue') when it isn't. Every ambiguous case is logged with its vin
+    and candidate count -- auditable, not silent.
 
     Returns (row_or_None, status_str) where status_str is one of:
-    'no_taegram_match', 'ok', 'ok_vin_disambiguated', 'ok_salevalue_disambiguated'.
+    'no_taegram_match', 'ok', 'ok_salevalue_disambiguated'.
     """
-    candidates = taegram_by_stock_id.get(sid)
+    candidates = taegram_by_vin.get(vin)
     if not candidates:
         return None, 'no_taegram_match'
     if len(candidates) == 1:
         return candidates[0], 'ok'
-
-    def _vin_of(row):
-        v = row.get('vin')
-        return str(v).strip() if pd.notna(v) else None
-
-    vin_key = str(vin).strip() if pd.notna(vin) else None
-    vin_matches = [r for r in candidates if vin_key is not None and _vin_of(r) == vin_key]
-    if len(vin_matches) == 1:
-        return vin_matches[0], 'ok_vin_disambiguated'
-
-    pool = vin_matches if vin_matches else candidates
-    if len(pool) == 1:
-        return pool[0], 'ok_vin_disambiguated'
 
     target_sv = float(salevalue) if pd.notna(salevalue) else None
 
@@ -535,9 +573,9 @@ def resolve_raw_row(sid, vin, salevalue, taegram_by_stock_id):
             return float('inf')
         return abs(float(v) - target_sv)
 
-    best = min(pool, key=_dist)
-    print(f"  [{sid}] ambiguous taegram match ({len(candidates)} candidates, "
-          f"{len(vin_matches)} vin-matched) -- picked closest salevalue.")
+    best = min(candidates, key=_dist)
+    print(f"  [{vin}] ambiguous taegram match ({len(candidates)} candidates) "
+          f"-- picked closest salevalue.")
     return best, 'ok_salevalue_disambiguated'
 
 
@@ -550,26 +588,26 @@ def run_full_mode(args):
     test_df = load_test_predictions_csv(args.test_predictions_csv)
     n_total = len(test_df)
 
-    target_ids = set(test_df['stock_id'].astype(str).str.strip())
-    taegram_raw = load_taegram_subset(args.taegram_csv, target_ids)
+    target_vins = set(test_df['vin'].dropna().astype(str).str.strip())
+    taegram_raw = load_taegram_subset(args.taegram_csv, target_vins)
     taegram_legacy = apply_schema_adapter(taegram_raw)
-    taegram_by_stock_id = build_taegram_lookup(taegram_legacy)
+    taegram_by_vin = build_taegram_lookup(taegram_legacy)
 
     # Pre-populate one result dict per test_predictions.csv row, in order,
     # so the final output always has exactly n_total rows -- whether or not
     # that row ever reaches a live call. `pending` tracks only the rows
     # that got a valid request body, for the batching step below.
     results = []
-    pending = []  # (result_index, stock_id, body)
+    pending = []  # (result_index, vin, body)
     n_no_match = 0
     n_build_failed = 0
 
     for _, row in test_df.iterrows():
         sid = str(row['stock_id']).strip()
-        vin = row['vin']
+        vin = str(row['vin']).strip()
         actual = row['salevalue']
 
-        raw_row, status = resolve_raw_row(sid, vin, actual, taegram_by_stock_id)
+        raw_row, status = resolve_raw_row(vin, actual, taegram_by_vin)
         result = {
             'stock_id': sid,
             'vin': vin,
@@ -600,7 +638,7 @@ def run_full_mode(args):
             results.append(result)
             continue
 
-        pending.append((len(results), sid, body))
+        pending.append((len(results), vin, body))
         results.append(result)
 
     print(f"Resolved {len(pending)}/{n_total} rows to a valid request body "
@@ -621,7 +659,7 @@ def run_full_mode(args):
             print(f"  batch {b_idx}/{n_batches} failed ({e}) -- "
                   f"retrying its {len(chunk)} rows individually...")
             responses = []
-            for _, sid, body in chunk:
+            for _, vin, body in chunk:
                 try:
                     responses.append(
                         call_predict(args.base_url, args.model, api_key, body, k_pos=0, k_neg=0))
@@ -629,7 +667,7 @@ def run_full_mode(args):
                     responses.append(e2)
 
         n_ok = 0
-        for (result_index, sid, _), resp in zip(chunk, responses):
+        for (result_index, vin, _), resp in zip(chunk, responses):
             r = results[result_index]
             if isinstance(resp, Exception):
                 n_call_failed += 1
