@@ -713,6 +713,60 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
     _BOOL_TRUE_TOKENS  = {'true', 't', 'yes', 'y', '1'}
     _BOOL_FALSE_TOKENS = {'false', 'f', 'no', 'n', '0'}
 
+    # Raw picklist-ID columns that are fed straight through into the final
+    # feature matrix as their own raw feature (in addition to whatever
+    # derived features get built from them, e.g. nav_condition -> both
+    # nav_severity AND the raw nav_condition column itself survive). A live
+    # caller can legitimately send the ID as a JSON STRING rather than a
+    # JSON number (these fields are typed Union[str, int, float] on
+    # PredictRequest) -- pydantic does not coerce that to a number. Two
+    # distinct problems follow if it's left as a string:
+    #   1. SEV_COLS' `.map(sev_map)` below does an exact-key lookup with NO
+    #      normalization of the value being looked up (only the dict's own
+    #      keys were lowercased/left-as-is when built) -- a string like
+    #      "22968" does not match the int key 22968, so the severity/
+    #      runs_flag/unknown-flag extraction silently falls back to
+    #      "unknown" instead of raising, which is a much quieter bug than #2.
+    #   2. The raw column itself reaches XGBoost as an unencoded 'object'
+    #      dtype (a lone string in a single-row column can't be anything
+    #      else), which XGBoost's inplace_predict hard-rejects outright
+    #      (ValueError: DataFrame.dtypes for data must be int, float, bool
+    #      or category).
+    # _coerce_numeric_id_like() below fixes both by converting a numeric-
+    # looking value to a real float BEFORE any of that runs. This is a
+    # no-op for real training data on both pipelines -- script21's
+    # numeric-schema data is already float-dtype at fit time (nothing here
+    # is ever a string to begin with), and script17's legacy text data
+    # never happens to be a numeric-looking string either -- so it only
+    # ever changes behavior for a live request that stringified an ID.
+    # Genuine non-numeric text (e.g. script17's real condition labels) is
+    # left completely untouched.
+    RAW_PICKLIST_ID_COLS = [
+        'vehicle_type', 'nav_color',
+        'nav_condition', 'enginecondition', 'transmissioncondition',
+        'bodypaintcondition', 'interiorcondition', 'tirecondition',
+        'state_province_of_title', 'vstate_name',
+    ]
+
+    @staticmethod
+    def _coerce_numeric_id_like(series):
+        """Convert values that look like a number (already int/float, or a
+        numeric-looking string e.g. '22968'/'22968.0') to a real float.
+        Anything else (genuine non-numeric text, None/NaN, unparseable
+        strings) is returned completely unchanged."""
+        def _try_num(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                return v
+            if isinstance(v, str):
+                try:
+                    return float(v.strip())
+                except ValueError:
+                    return v
+            return v
+        return series.map(_try_num)
+
     @classmethod
     def _coerce_bool_flag(cls, series):
         """Map messy boolean-ish values to a clean 0/1 float.
@@ -1144,6 +1198,18 @@ class SaleValuePreprocessor(BaseEstimator, TransformerMixin):
         for col in self.BOOL_FLAG_COLS:
             if col in X.columns:
                 X[col] = self._coerce_bool_flag(X[col])
+
+        # Step 4.6: coerce a numeric-looking string (e.g. a live caller
+        # sending a picklist ID as a JSON string) back to a real number on
+        # the raw picklist-ID columns, BEFORE severity/runs-flag/unknown-flag
+        # extraction (_engineer()'s SEV_COLS loop, below) or the final
+        # feature matrix ever see it -- see RAW_PICKLIST_ID_COLS above for
+        # why. Also before _normalize_text() so a coerced column is numeric
+        # dtype and skipped by its object-dtype column selection, same as
+        # the BOOL_FLAG_COLS coercion just above.
+        for col in self.RAW_PICKLIST_ID_COLS:
+            if col in X.columns:
+                X[col] = self._coerce_numeric_id_like(X[col])
 
         X = self._normalize_text(X)
         if self.use_cult:
