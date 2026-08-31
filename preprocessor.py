@@ -6,6 +6,7 @@
 #   - app/inference_script17.py
 #   - app/inference_script21.py
 # ============================================================
+import os
 import re
 import warnings
 import numpy as np
@@ -440,19 +441,53 @@ UNKNOWN_CONDITION_IDS = {
 }
 
 # ============================================================
-# PICKLIST ID -> DISPLAY NAME (human-readable contexts only: the Granite
-# LLM prompt's car-summary line and the SHAP "value" shown to the user --
-# NOT used by feature engineering above, which only needs severity numbers).
-# Same confirmed ID<->name correspondence as the *_SEV dicts' ID keys, just
-# inverted for text output instead of a severity number. Kept as separate,
-# explicit dicts rather than derived from *_SEV (multiple IDs can share one
-# severity, e.g. ENGINE_SEV's 23055/23056 both -> 1, so severity alone can't
-# be inverted back to a unique name).
+# CRM picklist CSV -> DISPLAY NAME (authoritative source, preferred).
+# artifacts/crm_picklist.csv is a full CRM picklist export (id, name, plus
+# 17 other columns we don't need) with a GLOBALLY unique `id` column -- a
+# real DB primary key spanning many unrelated picklist types (not just car
+# fields), so a flat {id: name} lookup built from just id/name correctly
+# serves every picklist-ID field at once, with no per-field scoping needed.
+# Only those two columns are read (usecols=) and kept in memory.
+# Loaded lazily (once) and cached; resolves ARTIFACTS_DIR the same way
+# app/main.py and the inference pipelines do, so it works both locally
+# (./artifacts) and in Docker (/app/artifacts, COPY'd in automatically --
+# .dockerignore doesn't exclude artifacts/). Missing/unreadable file ->
+# empty dict, not an error -- describe_picklist_value/
+# describe_other_damages_value below fall back to the hardcoded dicts (or
+# the raw value) exactly as if this CSV never existed.
+_CRM_PICKLIST_CACHE = None  # lazily populated {int id: str name}, or {} on failure
+
+
+def _load_crm_picklist_id_to_name():
+    global _CRM_PICKLIST_CACHE
+    if _CRM_PICKLIST_CACHE is not None:
+        return _CRM_PICKLIST_CACHE
+    path = os.path.join(os.environ.get('ARTIFACTS_DIR', './artifacts'), 'crm_picklist.csv')
+    try:
+        df = pd.read_csv(path, usecols=['id', 'name'])
+        _CRM_PICKLIST_CACHE = {
+            int(i): n for i, n in zip(df['id'], df['name']) if pd.notna(n)
+        }
+    except (FileNotFoundError, ValueError, KeyError, OSError):
+        _CRM_PICKLIST_CACHE = {}
+    return _CRM_PICKLIST_CACHE
+
+
+# ============================================================
+# PICKLIST ID -> DISPLAY NAME fallback dicts (human-readable contexts only:
+# the Granite LLM prompt's car-summary line and the SHAP "value" shown to
+# the user -- NOT used by feature engineering above, which only needs
+# severity numbers). Same confirmed ID<->name correspondence as the *_SEV
+# dicts' ID keys, just inverted for text output instead of a severity
+# number. Kept as separate, explicit dicts rather than derived from *_SEV
+# (multiple IDs can share one severity, e.g. ENGINE_SEV's 23055/23056 both
+# -> 1, so severity alone can't be inverted back to a unique name).
 #
-# State fields (state_title_picklist/state_picklist_id) have no equivalent
-# dict here: their ID<->name mapping is only partially known (the ~59 middle
-# IDs were never confirmed -- see the original mapping notes), so a raw
-# numeric ID displays as-is for those two.
+# Used only as a FALLBACK now, when crm_picklist.csv is missing/stale --
+# describe_picklist_value() below tries the CSV first. Covers only the 6
+# condition fields (never had state_title_picklist/state_picklist_id/
+# vehicle_type/color entries -- those four display the raw ID as-is if the
+# CSV isn't available, same as before the CSV existed).
 NAV_CONDITION_ID_TO_NAME = {
     22968: 'Runs & Drives', 22971: 'Runs & Moves / Don’t Drive',
     22969: 'Runs / Doesn’t Move', 22974: 'Cranks, won’t start',
@@ -506,41 +541,64 @@ def describe_picklist_value(raw_key, value):
     (LLM prompts, SHAP "value" fields) -- NOT used by feature engineering,
     which works directly off the ID via the *_SEV dicts above.
 
-    Returns `value` unchanged when raw_key isn't a condition column, the
-    value isn't numeric (e.g. it's already legacy text), or the ID isn't
-    recognized -- so this is always safe to call speculatively.
+    Tries crm_picklist.csv (authoritative, covers all 10 raw keys below)
+    first, then CONDITION_ID_TO_NAME_BY_RAW_KEY (fallback, 6 condition
+    fields only). Returns `value` unchanged when raw_key isn't one of
+    SaleValuePreprocessor.RAW_PICKLIST_ID_COLS, the value isn't numeric
+    (e.g. it's already legacy text), or the ID isn't recognized by either
+    source -- so this is always safe to call speculatively.
     """
-    id_to_name = CONDITION_ID_TO_NAME_BY_RAW_KEY.get(raw_key)
-    if id_to_name is None or value is None:
+    if raw_key not in SaleValuePreprocessor.RAW_PICKLIST_ID_COLS or value is None:
         return value
     if isinstance(value, str):
         return value  # already text (legacy caller) -- nothing to decode
     try:
-        return id_to_name.get(int(value), value)
+        int_value = int(value)
     except (TypeError, ValueError):
         return value
+    crm_name = _load_crm_picklist_id_to_name().get(int_value)
+    if crm_name is not None:
+        return crm_name
+    id_to_name = CONDITION_ID_TO_NAME_BY_RAW_KEY.get(raw_key)
+    if id_to_name is not None:
+        return id_to_name.get(int_value, value)
+    return value
 
 
 def describe_other_damages_value(value):
     """Decode other_damages' display value: a scalar numeric picklist ID, or
-    a list of them (live multi-select), to comma-joined label text via
-    SaleValuePreprocessor.OTHER_DAMAGE_ID_TO_LABEL. Text/JSON-string legacy
-    values and anything unrecognized pass through unchanged -- safe to call
-    speculatively, same convention as describe_picklist_value above.
+    a list of them (live multi-select), to comma-joined label text. Tries
+    crm_picklist.csv first, then falls back to
+    SaleValuePreprocessor.OTHER_DAMAGE_ID_TO_LABEL (the dict feature
+    engineering itself uses -- untouched, still the sole source there).
+    Text/JSON-string legacy values and anything unrecognized pass through
+    unchanged -- safe to call speculatively, same convention as
+    describe_picklist_value above.
     """
+    crm = _load_crm_picklist_id_to_name()
     id_to_label = SaleValuePreprocessor.OTHER_DAMAGE_ID_TO_LABEL
+
+    def _label_for(item_id):
+        """None if unrecognized by either source -- distinct from a
+        (theoretical, never-seen-in-practice) empty-string name, which
+        `or` would otherwise treat as "not found" too."""
+        name = crm.get(item_id)
+        return name if name is not None else id_to_label.get(item_id)
+
     if value is None:
         return value
     if isinstance(value, (int, float)):
         try:
-            return id_to_label.get(int(value), value)
+            label = _label_for(int(value))
+            return label if label is not None else value
         except (TypeError, ValueError):
             return value
     if isinstance(value, list):
         labels = []
         for item in value:
             if isinstance(item, (int, float)):
-                labels.append(id_to_label.get(int(item), str(item)))
+                label = _label_for(int(item))
+                labels.append(label if label is not None else str(item))
             elif isinstance(item, dict):
                 labels.append(str(item.get('name', item)))
             else:

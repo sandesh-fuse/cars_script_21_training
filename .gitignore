@@ -137,5 +137,11 @@ wheels/
 
 .env
 artifacts/script21/
-artifacts/
+artifacts/*
 *.csv
+# crm_picklist.csv is a small (222KB) reference lookup table, not a
+# training-script output -- tracked so a fresh checkout/CI has it too.
+# (artifacts/ was changed to artifacts/* above so git actually traverses
+# into the directory to evaluate this negation -- a bare "artifacts/"
+# directory-exclude can't be re-included from inside.)
+!artifacts/crm_picklist.csv
