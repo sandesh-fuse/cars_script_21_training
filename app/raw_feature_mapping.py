@@ -393,6 +393,15 @@ def collapse_engineered_to_raw(
     pos_groups.sort(key=lambda g: g['dollar_impact'], reverse=True)
     neg_groups.sort(key=lambda g: g['dollar_impact'])
 
+    # Round to cents / hundredths-of-a-percent for the response -- these are
+    # sums of several engineered features' marginal contributions, so they
+    # otherwise come out with double-precision noise (e.g. 385.6654971455845)
+    # that's meaningless past 2 decimal places for a dollar amount or a
+    # percentage.
+    for g in pos_groups + neg_groups:
+        g['dollar_impact'] = round(g['dollar_impact'], 2)
+        g['pct_of_prediction'] = round(g['pct_of_prediction'], 2)
+
     return {
         'top_positive': pos_groups[:k_pos],
         'top_negative': neg_groups[:k_neg],
