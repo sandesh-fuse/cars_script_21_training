@@ -215,7 +215,6 @@ class PredictRequest(BaseModel):
     vehicle_type: Optional[Union[int, float]] = None
     vehicle_category: Optional[str] = None  # legacy name: body_type
     body_subtype: Optional[str] = None
-    doors: Optional[Union[str, int, float]] = None
     mileage: Optional[float] = None
 
     # Condition & Visual attrs

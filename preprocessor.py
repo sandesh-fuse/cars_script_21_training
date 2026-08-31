@@ -247,7 +247,6 @@ NEW_TO_OLD_SCHEMA_MAP = {
 
     # --- Core attributes & categoricals ---
     "vehicle_category": "body_type",
-    "body_type": "oem_body_style",             # NOTE: incoming 'body_type' != legacy 'body_type' — see below
     "accessible_for_tow_truck": "accessiblefortwotruck",
     "located_at_donation_c_a": "locatedatdonationca",
     "speciality_item": "Specialty Item",
