@@ -108,7 +108,15 @@ class Script17Pipeline:
         # k != 0 rather than k > 0: a negative k means "all features"
         # (see collapse_engineered_to_raw), so only an explicit 0 on BOTH
         # sides means the caller wants no SHAP work done at all.
-        if explain or (k_pos != 0 or k_neg != 0):
+        #
+        # Deliberately NOT `explain or (...)`: with k_pos=k_neg=0 there are no
+        # attributions for the explanation to be about, and the LLM would be
+        # handed an empty feature list and invent generic filler. Skipping the
+        # whole block leaves no "shap" key on the result, which is what makes
+        # main.py's `if explain_flag and pred_result.get("shap")` fall through
+        # -- so explain=true with k=0 returns explanation=null AND avoids the
+        # expensive TreeExplainer pass rather than computing SHAP to discard it.
+        if k_pos != 0 or k_neg != 0:
             # 1. Extract calculated values from the preprocessor output
             if hasattr(X_te, "iloc"):
                 calc_vals = X_te.iloc[0].values

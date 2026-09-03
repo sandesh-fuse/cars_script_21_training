@@ -16,7 +16,20 @@ dollar impact and the most-impactful underlying engineered feature kept as
 provenance for debugging.
 """
 
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, NamedTuple, Optional
+
+# Shown instead of null wherever a group has no value to report. The /predict
+# response is read by non-technical users, and a bare null reads as a bug
+# rather than as an explanation.
+#
+# TWO strings, not one, because the two situations are different facts and
+# only one of them is actionable: a reader who sees "Not provided" can go and
+# supply the missing field and get a better prediction, whereas
+# "Internally calculated value" means the model derived this itself and there
+# is nothing for them to send.
+VALUE_NOT_PROVIDED = "Not provided"             # the caller didn't send the input
+VALUE_INTERNAL = "Internally calculated value"  # derived by the model; no caller input exists
 
 # Raw keys never shown to users, however large their SHAP attribution.
 #
@@ -55,7 +68,13 @@ from preprocessor import describe_picklist_value, describe_other_damages_value
 BUCKET_MARKET   = ("__market_trend",      "Used-vehicle market trend")
 BUCKET_CULT     = ("__collectible",       "Collectible/cult vehicle status")
 BUCKET_LOCATION = ("__location",          "Vehicle location (ZIP)")
-BUCKET_UNKNOWNS = ("__unknowns",          "How many condition fields are unknown")
+# Label, not key (same rule as BUCKET_CLUSTER below): "How many condition
+# fields are unknown" reads as "how many were left blank", which is the one
+# thing n_unknowns does NOT count -- _is_unknown_condition() in
+# preprocessor.py returns False for a missing value, so this counts only
+# fields the submitter explicitly answered with that field's "Unknown"
+# picklist option.
+BUCKET_UNKNOWNS = ("__unknowns",          "Condition fields marked Unknown")
 BUCKET_MECH     = ("__mechanical",        "Overall mechanical condition")
 BUCKET_TIME     = ("__time_of_sale",      "Time of sale (day/month/season)")
 BUCKET_ENGINE   = ("__engine_specs",      "Engine specifications")
@@ -313,6 +332,249 @@ def _format_value(val: Any) -> Optional[str]:
     return s if s else None
 
 
+def _request_value(request_dict: Dict, internal_key: str) -> Any:
+    """The value the caller sent for an INTERNAL raw-feature name, or None.
+
+    request_dict uses the CURRENT PredictRequest field names, which differ
+    from the internal/engineered names for every field the new-schema
+    migration renamed -- so look under the internal name first, then fall
+    back to INTERNAL_TO_REQUEST_FIELD's alias.
+
+    A key that IS present but holds None short-circuits to None without
+    consulting the alias. That is deliberate and matches /predict: main.py
+    dumps the body with exclude_none=False, so a field the caller omitted is
+    present-and-None rather than absent.
+    """
+    if internal_key in request_dict:
+        return request_dict[internal_key]
+    request_field = INTERNAL_TO_REQUEST_FIELD.get(internal_key)
+    return request_dict.get(request_field) if request_field else None
+
+
+# ============================================================
+# BUCKET VALUE RESOLVERS
+# ============================================================
+# A BUCKET_* group is keyed by a synthetic sentinel ('__mechanical', ...),
+# never by a real request field, so the request_dict lookup in _collapse()
+# below can only ever MISS for one -- which is why every bucket rendered
+# `value: null` no matter what the caller sent. Each resolver here rebuilds a
+# readable value from whatever its bucket is actually made of: the request
+# fields that feed it, or the engineered value the model saw.
+#
+# A table, not a chain of `elif raw_key == ...` branches in _collapse():
+# '__collectible' was originally done that way, and there are five now, each
+# with a different source.
+#
+# Resolvers return anything _format_value() understands; the CALL SITE
+# formats. Returning None means "no honest value", and _collapse() then
+# substitutes VALUE_NOT_PROVIDED.
+
+
+class _BucketContext(NamedTuple):
+    """Everything a bucket resolver is allowed to read.
+
+    Bundled rather than passed as three positional args so adding a fourth
+    source later doesn't touch every resolver's signature.
+    """
+    request_dict:   Dict            # the original API request body
+    feature_values: Dict[str, Any]  # engineered feature name -> value the model saw
+    is_cult:        Optional[bool]  # pipeline-computed cult flag (script21 only)
+
+
+# (internal raw-feature name, short label) for the three condition fields the
+# '__mechanical' bucket is ACTUALLY built from. Not the six condition fields:
+# mechanical_severity_{sum,mean,max} aggregate engine_severity +
+# trans_severity + tire_severity only (see preprocessor.py's _engineer), so
+# interior/body/driveability are deliberately absent -- each already has its
+# own raw group.
+_MECH_PARTS = (
+    ('enginecondition',       'Engine'),
+    ('transmissioncondition', 'Transmission'),
+    ('tirecondition',         'Tires'),
+)
+
+# The six condition fields n_unknowns counts over (UNKNOWN_FLAG_COLS in
+# preprocessor.py), as PredictRequest field names. Used only to tell "caller
+# answered all six, none Unknown" apart from "caller sent none of them" --
+# n_unknowns is 0 in both cases.
+_CONDITION_REQUEST_FIELDS = (
+    'vehicle_cond_picklist_id',
+    'body_paint_cond_picklist_id',
+    'engine_cond_picklist_id',
+    'transmission_cond_picklist_id',
+    'tire_cond_picklist_id',
+    'interior_cond_picklist_id',
+)
+_N_CONDITION_FIELDS = len(_CONDITION_REQUEST_FIELDS)
+
+# The same digit-extract the preprocessor applies to vazipcode before it
+# buckets the ZIP.
+_ZIP_DIGITS_RE = re.compile(r'(\d{1,5})')
+
+
+def _value_collectible(ctx: _BucketContext) -> Any:
+    """'__collectible' -> the pipeline's computed cult flag ("yes"/"no").
+
+    Never a request field: it's derived from make/model/year by
+    compute_cult_flag(), so only the pipeline can supply it. script17 has no
+    cult routing and passes is_cult=None -- reported as VALUE_INTERNAL rather
+    than "Not provided", which would wrongly imply the caller could send it.
+    """
+    return ctx.is_cult if ctx.is_cult is not None else VALUE_INTERNAL
+
+
+def _value_mechanical(ctx: _BucketContext) -> Optional[str]:
+    """'__mechanical' -> "Engine: Operational, Transmission: Operational,
+    Tires: 1 or More Tires are Flat*".
+
+    Rebuilt from the REQUEST's picklist IDs, never from the severity numbers
+    the model saw: the *_SEV maps are many-to-one (ENGINE_SEV sends both
+    23055 "Rebuilt/Replaced" and 23056 "Minor Issues / Still Functional" to
+    1), so a severity integer cannot be turned back into the words the caller
+    picked. The picklist ID is the only lossless route back to text.
+
+    Only the parts the caller actually sent are listed -- a request carrying
+    just an engine condition reads "Engine: Operational", not
+    "Engine: Operational, Transmission: None, Tires: None".
+
+    A part whose ID doesn't decode is DROPPED rather than shown:
+    describe_picklist_value() is speculative-safe and returns its input
+    unchanged when it can't decode, so an unrecognised ID would otherwise
+    surface to the reader as the bare number ("Engine: 99999").
+    """
+    parts = []
+    for internal_key, short_label in _MECH_PARTS:
+        raw = _request_value(ctx.request_dict, internal_key)
+        if raw is None:
+            continue
+        decoded = describe_picklist_value(internal_key, raw)
+        # Only a str means it actually decoded -- an undecodable ID comes
+        # back as the original number.
+        if not isinstance(decoded, str):
+            continue
+        text = _format_value(decoded)
+        if text is not None:
+            parts.append(f"{short_label}: {text}")
+    return ', '.join(parts) if parts else None
+
+
+def _value_unknowns(ctx: _BucketContext) -> Optional[str]:
+    """'__unknowns' -> "2 of 6 condition fields marked Unknown".
+
+    Read from the n_unknowns SHAP record -- the number the model actually
+    used -- rather than recounted from request_dict. Recounting would mean
+    reimplementing preprocessor._is_unknown_condition()'s exact predicate
+    (a different "Unknown" picklist ID per column, plus the legacy text form)
+    in a second place, free to drift from it.
+
+    Note what that predicate does NOT count: _is_unknown_condition() returns
+    False for a MISSING value, so this is the number of condition fields the
+    submitter explicitly ANSWERED "Unknown" -- fields left blank are not
+    included. Hence "marked Unknown", not "are unknown".
+
+    n_unknowns == 0 is therefore ambiguous on its own: it means either "all
+    six answered, none Unknown" or "the caller sent none of them". Only the
+    first deserves the "0 of 6" phrasing -- claiming it for a request that
+    answered nothing would imply questions were asked and cleared.
+    """
+    if not any(ctx.request_dict.get(f) is not None
+               for f in _CONDITION_REQUEST_FIELDS):
+        return None  # -> "Not provided": the caller answered none of them
+
+    n = ctx.feature_values.get('n_unknowns')
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        # Only reachable when n_unknowns has exactly 0.0 SHAP impact and so
+        # isn't among the records at all (shap_to_dollar_terms keeps strictly
+        # >0 / <0), and the group was formed by all_unknown / any_unknown /
+        # unknowns_x_* instead.
+        return None
+    if n <= 0:
+        return f"No condition fields marked Unknown (0 of {_N_CONDITION_FIELDS})"
+    return f"{n} of {_N_CONDITION_FIELDS} condition fields marked Unknown"
+
+
+def _value_other_damages(ctx: _BucketContext) -> Optional[str]:
+    """'__other_damages' -> "Mold, Flood Damage", or "None reported".
+
+    other_damage_pklist_id is a multi-select, so the value can be a LIST of
+    picklist IDs; describe_other_damages_value() handles that as well as the
+    scalar and legacy-text forms.
+
+    "None reported" -- NOT "Not provided" -- for an absent or empty field,
+    because that is exactly what the model scored: a missing field reads as
+    zero damage tokens (has_other_damage=0). "We know there is no damage" is
+    a real fact and a different claim from "we weren't told"; this group most
+    often surfaces with a POSITIVE impact on a clean car, where it is the
+    entire explanation.
+    """
+    raw = _request_value(ctx.request_dict, 'other_damages')
+    # An empty list is "the multi-select was opened and nothing was picked".
+    # describe_other_damages_value() passes it through untouched (no labels
+    # to join) and _format_value() would then str() it into a literal "[]".
+    if isinstance(raw, list) and not raw:
+        raw = None
+    if raw is None:
+        return "None reported"
+    decoded = describe_other_damages_value(raw)
+    # As in _value_mechanical: a non-str means nothing decoded, and the bare
+    # ID must not reach the reader.
+    return _format_value(decoded) if isinstance(decoded, str) else None
+
+
+def _value_location(ctx: _BucketContext) -> Optional[str]:
+    """'__location' -> "ZIP 01234".
+
+    Normalized with the SAME digit-extract-then-zero-pad the preprocessor
+    applies before bucketing the ZIP, so we show the ZIP the model actually
+    used. The padding is not cosmetic: PredictRequest.zip is coerced to a
+    float, so a Massachusetts "01234" arrives as 1234.0 and would otherwise
+    display as "ZIP 1234" -- a real but DIFFERENT ZIP -- while
+    zip_first2/zip_first3/zip_full were all built from the padded "01234".
+
+    Zero is treated as absent: it is a placeholder, and zero-padding would
+    turn it into the plausible-looking "ZIP 00000".
+    """
+    raw = _request_value(ctx.request_dict, 'vazipcode')
+    if raw is None:
+        return None
+    try:
+        if float(raw) == 0:
+            return None
+    except (TypeError, ValueError):
+        pass  # non-numeric text -- the regex below decides
+    match = _ZIP_DIGITS_RE.search(str(raw))  # NaN -> "nan" -> no match
+    if match is None:
+        return None
+    return f"ZIP {match.group(1).zfill(5)}"
+
+
+# Bucket sentinel -> resolver.
+BUCKET_VALUE_RESOLVERS = {
+    BUCKET_CULT[0]:     _value_collectible,
+    BUCKET_MECH[0]:     _value_mechanical,
+    BUCKET_UNKNOWNS[0]: _value_unknowns,
+    BUCKET_DAMAGE[0]:   _value_other_damages,
+    BUCKET_LOCATION[0]: _value_location,
+}
+
+# Buckets with no per-vehicle value BY NATURE -- deliberately absent from the
+# table above, and reported as VALUE_INTERNAL rather than "Not provided"
+# because nothing was ever expected from the caller:
+#   __market_trend, __time_of_sale -- derived only from the submission date
+#       (CPI / Manheim / auto-loan index; day/month/season). Identical for
+#       every vehicle submitted that day, so there is no per-vehicle value.
+#   __vehicle_profile -- an opaque k-means cluster id (0-11, and -1 for most
+#       vehicles); the number means nothing to a reader, and the label
+#       already says "cars like this one".
+#   __engine_specs -- dead at serving time: use_dataone is False in the
+#       deployed artifacts, so none of its features exist.
+INTERNAL_ONLY_BUCKETS = frozenset({
+    BUCKET_MARKET[0], BUCKET_TIME[0], BUCKET_CLUSTER[0], BUCKET_ENGINE[0],
+})
+
+
 def collapse_engineered_to_raw(
     feature_records: List[Dict],
     request_dict: Dict,
@@ -404,6 +666,24 @@ def collapse_engineered_to_raw(
         if _resolve_raw(r['feature'])[0] == r['feature']
     }
 
+    # Engineered feature name -> the value the model actually saw, for EVERY
+    # record. Read by BUCKET_VALUE_RESOLVERS for inputs the caller never sent
+    # and that aren't self-named either -- 'n_unknowns' is the only one today.
+    #
+    # Built here, over ALL records, for the same reason self_named_values is:
+    # the positive and negative pools are collapsed INDEPENDENTLY, so a map
+    # built per-pool would give a group appearing on both sides its value on
+    # only one of them.
+    #
+    # This does NOT subsume self_named_values. That map is looked up BY
+    # raw_key, which is why it must stay restricted to self-named features (a
+    # group's other members carry encoded values). This one is only ever read
+    # by an explicit feature name.
+    feature_values = {r['feature']: r.get('value') for r in sorted_recs}
+    bucket_ctx = _BucketContext(request_dict=request_dict,
+                                feature_values=feature_values,
+                                is_cult=is_cult)
+
     # Take top look_factor*K from each end
     pos_pool = [r for r in sorted_recs if r.get('dollar_impact_marginal', 0.0) > 0][:look_factor * k_pos]
     neg_pool = list(reversed([r for r in sorted_recs if r.get('dollar_impact_marginal', 0.0) < 0]))[:look_factor * k_neg]
@@ -426,13 +706,7 @@ def collapse_engineered_to_raw(
                 # itself isn't a key in request_dict.
                 raw_val = None
                 if raw_key:
-                    val = None
-                    if raw_key in request_dict:
-                        val = request_dict[raw_key]
-                    else:
-                        request_field = INTERNAL_TO_REQUEST_FIELD.get(raw_key)
-                        if request_field and request_field in request_dict:
-                            val = request_dict[request_field]
+                    val = _request_value(request_dict, raw_key)
                     if val is not None:
                         # Decode a numeric picklist ID to its display name
                         # (e.g. 22968 -> "Runs & Drives") for condition/damage
@@ -443,17 +717,25 @@ def collapse_engineered_to_raw(
                         else:
                             val = describe_picklist_value(raw_key, val)
                         raw_val = _format_value(val)
-                    elif raw_key == BUCKET_CULT[0] and is_cult is not None:
-                        # '__collectible' never maps to a raw request field --
-                        # it's a computed flag, not something the caller sent
-                        # -- so the lookup above always misses. Surface the
-                        # pipeline's actual computed value here instead.
-                        raw_val = _format_value(is_cult)
+                    elif raw_key in BUCKET_VALUE_RESOLVERS:
+                        # A BUCKET_* sentinel is never a request field, so the
+                        # lookup above ALWAYS misses for one. Rebuild a
+                        # readable value from what the bucket is really made
+                        # of -- see BUCKET_VALUE_RESOLVERS.
+                        raw_val = _format_value(
+                            BUCKET_VALUE_RESOLVERS[raw_key](bucket_ctx))
                     elif raw_key in self_named_values:
                         # No request value, but the model computed this input
                         # itself -- show what it actually used. See
                         # self_named_values above.
                         raw_val = _format_value(self_named_values[raw_key])
+
+                # Never emit null: a bare null reads as a bug to a
+                # non-technical reader. Which sentinel depends on WHY there is
+                # no value -- see VALUE_NOT_PROVIDED / VALUE_INTERNAL.
+                if raw_val is None:
+                    raw_val = (VALUE_INTERNAL if raw_key in INTERNAL_ONLY_BUCKETS
+                               else VALUE_NOT_PROVIDED)
 
                 groups[group_key] = {
                     'feature_raw_key':  raw_key or r['feature'],

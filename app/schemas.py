@@ -344,7 +344,11 @@ class ShapFeatureRecord(BaseModel):
 
     feature_raw_key: str  # raw feature key (e.g. 'make', '__collectible')
     feature_label: str  # user-facing label (e.g. 'Make', 'Collectible/cult status')
-    value: Optional[str] = None  # raw value from request, or None
+    # Raw value from the request; a rebuilt readable description for the
+    # BUCKET_* groups (e.g. "Engine: Operational, Tires: ..."); or one of
+    # raw_feature_mapping's sentinels -- "Not provided" (caller omitted the
+    # input) / "Internally calculated value" (model derived it). Never null.
+    value: Optional[str] = None
     dollar_impact: (
         float  # summed marginal $ impact across underlying engineered features
     )

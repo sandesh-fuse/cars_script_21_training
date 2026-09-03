@@ -5,7 +5,7 @@ FastAPI service exposing /predict for both Script 17 and Script 21 pipelines.
 
 Endpoint:
     POST /predict?model={script17|script21}&explain={true|false}&shap_quantile={p5|p50|p95}&k_pos=N&k_neg=N
-         &explanation_units={both|percentage|dollar}&prompt_version={v1|v2|v3|v4}
+         &explanation_units={both|percentage|dollar}&prompt_version={v1|v2|v3}
 
 Request body (JSON): car attributes — see schemas.PredictRequest.
 
@@ -393,14 +393,14 @@ def predict(
     ),
     prompt_version: str = Query(
         "v1",
-        pattern="^(v1|v2|v3|v4)$",
+        pattern="^(v1|v2|v3)$",
         description=(
-            "Which Granite prompt template generates the explanation. "
-            "v1 (default): top 5 features, 40-60 words, no per-feature "
-            "context. v2: top 5, no length limit, adds plain-English "
-            "context per feature. v3: top 3, no length limit. v4: top 3, "
-            "concise (~50-70 words). Feature counts are ceilings capped by "
-            "k_pos/k_neg. Only relevant when explain=true."
+            "Which Granite prompt template generates the explanation. All "
+            "three cover the top 5 features. v1 (default): 40-60 words, no "
+            "per-feature context. v2: ~80 words, adds plain-English context "
+            "per feature plus the value and why it moved the price. v3: no "
+            "length limit, the most verbose form. The feature count is a "
+            "ceiling capped by k_pos/k_neg. Only relevant when explain=true."
         ),
     ),
 ):

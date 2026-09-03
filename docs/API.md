@@ -89,16 +89,22 @@ call.
 
 #### `prompt_version` options
 
-| Version | Features covered | Length | Per-feature context |
+| Version | Length | Per-feature context | Causal reasoning |
 |---|---|---|---|
-| `v1` (default) | top 5 | 40-60 words | no |
-| `v2` | top 5 | no limit | yes |
-| `v3` | top 3 | no limit | yes |
-| `v4` | top 3 | ~50-70 words | yes |
+| `v1` (default) | 40-60 words | no | no |
+| `v2` | ~80 words | yes | yes |
+| `v3` | no limit | yes | yes — most verbose |
+
+All three cover the **top 5** features.
 
 "Per-feature context" adds a plain-English blurb about what each feature
 represents — e.g. a market-trend feature reads as "current U.S. economic
 conditions" — introduced in `v2` along with explicit null-value handling.
+
+"Causal reasoning" is `v2`'s addition: it states each feature's actual value
+and *why* that moved the price, rather than only that it did. So instead of
+"mileage reduced the value by -5.7%", you get "its 146,000 miles is heavy wear
+for a car this age, cutting -5.7% (-$58)".
 
 The feature count is a **ceiling, not a target**: `k_pos`/`k_neg` decide how many
 attributions exist at all, so `v2` shows only 2 positive features if you sent

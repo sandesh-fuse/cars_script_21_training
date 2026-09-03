@@ -35,7 +35,25 @@ from typing import Dict, Optional, List
 
 import logging
 
-from app.raw_feature_mapping import INTERNAL_TO_REQUEST_FIELD
+from app.raw_feature_mapping import (
+    INTERNAL_TO_REQUEST_FIELD,
+    VALUE_INTERNAL,
+    VALUE_NOT_PROVIDED,
+)
+
+# Placeholder strings raw_feature_mapping puts in a group's `value` when it
+# has nothing real to report. They must never reach the model: handed in as
+# "(actual value: Not provided)" it can readily turn a missing input into a
+# priced factor -- "the mechanical condition was not provided, reducing the
+# value by 13.9%". Imported rather than restated so the two files cannot
+# drift, and compared against the LOWERED string so the prompt behaviour
+# survives the sentinels ever being recapitalised.
+#
+# Applied to the three call sites fed from a SHAP group record (v1 _line,
+# v2 _line, and _fallback_explanation's _phrase). The two that read
+# request_dict directly keep the plain check -- they never see a sentinel.
+_VALUE_SENTINELS = ("", "nan",
+                    VALUE_NOT_PROVIDED.lower(), VALUE_INTERNAL.lower())
 from preprocessor import describe_picklist_value
 
 logger = logging.getLogger("car-sale-value-predictor")
@@ -220,7 +238,7 @@ def _build_prompt(
     def _line(r: Dict) -> str:
         label = r.get("feature_label", r.get("feature_raw_key", "feature"))
         val = r.get("value")
-        if val is not None and str(val).strip() not in ("", "nan"):
+        if val is not None and str(val).strip().lower() not in _VALUE_SENTINELS:
             head = f"{label} (value: {val})"
         else:
             head = label
@@ -313,8 +331,8 @@ FEATURE_CONTEXT: Dict[str, str] = {
     "__market_trend": "current U.S. economic and used-vehicle market conditions (inflation, wholesale used-car pricing, and auto loan rates)",
     "__collectible": "the vehicle's status as a sought-after collectible or cult model among enthusiasts",
     "__location": "regional demand and pricing patterns based on where the vehicle is located",
-    "__unknowns": "how many of the vehicle's condition details were left unspecified",
-    "__mechanical": "the vehicle's overall mechanical condition (engine, transmission, tires, interior)",
+    "__unknowns": "how many of the vehicle's six condition fields (driveability, body/paint, engine, transmission, tires, and interior) the submitter explicitly marked 'Unknown' -- fields simply left blank are NOT counted",
+    "__mechanical": "the vehicle's overall mechanical condition, specifically its engine, transmission, and tires (interior and body/paint are scored separately)",
     "__time_of_sale": "the time of year the sale occurs, which affects seasonal demand",
     "__engine_specs": "the vehicle's engine specifications (size, cylinders, horsepower)",
     "__vehicle_profile": "how this vehicle's overall profile compares to similar vehicles",
@@ -376,7 +394,7 @@ def _build_prompt_v2(
         # bucketed/macro features (market trend, collectible status, ...)
         # have value=None because they don't map to a single raw request
         # field, and the LLM must not invent one for those.
-        if val is not None and str(val).strip() not in ("", "nan"):
+        if val is not None and str(val).strip().lower() not in _VALUE_SENTINELS:
             head = f"{label} (actual value: {val}) -- represents {context}"
         else:
             head = f"{label} -- represents {context}"
@@ -412,23 +430,30 @@ def _build_prompt_v2(
     else:
         instruction_impact = 'Always express impacts in the exact format: "added approximately X% ($Y)" or "reduced the value by approximately X% ($Y)".'
 
-    # The only thing "concise" changes vs the base v2 prompt is instruction
-    # #7 (length) and the worked example -- everything else (feature-context
-    # blurbs, null-value handling, how many features are shown) is identical.
+    # The only thing `concise` changes vs the unlimited variant is instruction
+    # #7 (length + how much reasoning to give) and the worked example --
+    # everything else (feature-context blurbs, null-value handling, how many
+    # features are shown) is identical.
     if concise:
         instruction_7 = (
-            'Be extremely concise: write a SHORT, flowing summary in 2-3 sentences '
-            'total, roughly 50-70 WORDS -- combine multiple features into the same '
-            'sentence rather than giving each one its own sentence. Still briefly '
-            'name every feature listed above with a few words of what it represents '
-            'and its impact, but keep each mention as tight as possible. Do not use '
-            'markdown, bullet points, lists, or headings, and avoid redundant '
-            'connecting words like "furthermore, however, moreover".'
+            'Write a single flowing summary of around 80 words -- a guide, not a '
+            'hard limit: cover every feature listed above properly rather than '
+            'truncating to hit a count. For each one, state the actual VALUE and '
+            'explain WHY it moved the price in that direction, not just that it '
+            'did. For example, do not write "mileage reduced the value by -5.7%"; '
+            'write "its 150,000 miles is heavy wear for its age, cutting -5.7% '
+            '(-$58)". Keep each reason to a short clause, and group several '
+            'features into one sentence rather than giving each its own. Do not '
+            'restate a feature you have already covered. Do not use markdown, '
+            'bullet points, lists, or headings, and avoid redundant connecting '
+            'words like "furthermore, however, moreover".'
         )
         example_block = (
             '"The 2007 Dodge Caliber is valued around $931 (range: $207-$1,977). Its hatchback body '
-            '(everyday demand) and current U.S. economic conditions added +19.3% ($194) and +5.2% ($52); '
-            'its 146k miles driven and fair condition cut it by -5.7% (-$58) and -1.5% (-$15)."'
+            'appeals to steady everyday demand and current U.S. economic conditions favour used cars, '
+            'adding +19.3% ($194) and +5.2% ($52). Against that, its 146,000 miles is heavy wear for '
+            'a car this age, cutting -5.7% (-$58), and its fair overall condition means more work '
+            'before resale, taking a further -1.5% (-$15)."'
         )
     else:
         instruction_7 = (
@@ -446,7 +471,7 @@ def _build_prompt_v2(
             '(-$58), and its fair overall condition reduced it by a further -1.5% (-$15)."'
         )
     length_note = (
-        "NOT the length, which should stay very short regardless of how many features are listed above"
+        "NOT the length, which should stay around 80 words whatever the feature count"
         if concise
         else "NOT the length, which should scale to however many features are listed above"
     )
@@ -524,7 +549,7 @@ def _fallback_explanation(
     def _phrase(r: Dict, push_dir: str) -> str:
         label = r.get("feature_label", r.get("feature_raw_key", "a feature")).lower()
         val = r.get("value")
-        if val is not None and str(val).strip() not in ("", "nan"):
+        if val is not None and str(val).strip().lower() not in _VALUE_SENTINELS:
             name_with_value = f"the {label} of {val}"
         else:
             name_with_value = label
@@ -566,24 +591,28 @@ def explain(
 ) -> str:
     """Main entry: try Granite, fall back to template on any failure.
 
-    prompt_version selects the prompt template sent to Granite. Four
-    versions, varying along two axes -- how many features are covered, and
-    whether length is capped:
+    prompt_version selects the prompt template sent to Granite. Three
+    versions, all covering the top 5 features and forming a ladder of
+    increasing detail:
 
-      version | features | length          | per-feature context
-      --------|----------|-----------------|--------------------
-      "v1"    | top 5    | 40-60 words     | no  (production default)
-      "v2"    | top 5    | no limit        | yes
-      "v3"    | top 3    | no limit        | yes
-      "v4"    | top 3    | ~50-70 words    | yes
+      version | length       | per-feature context | causal reasoning
+      --------|--------------|---------------------|------------------
+      "v1"    | 40-60 words  | no                  | no   (default)
+      "v2"    | ~80 words    | yes                 | yes
+      "v3"    | no limit     | yes                 | yes  (most verbose)
 
     "per-feature context" is a plain-English blurb about what each feature
     represents (e.g. a market-trend feature reads as "current U.S. economic
     conditions"), introduced in v2 along with explicit null-value handling.
 
+    "causal reasoning" is v2's addition: it must state each feature's actual
+    VALUE and say WHY that moved the price -- "its 150,000 miles means well
+    above average wear for its age, cutting -5.7%" rather than the bare
+    "mileage reduced the value by -5.7%".
+
     The feature count is a CEILING, not a target: k_pos/k_neg decide how
-    many SHAP entries exist at all, so v2's top-5 yields only 2 features
-    when the request was made with k_pos=2.
+    many SHAP entries exist at all, so top-5 yields only 2 features when the
+    request was made with k_pos=2.
 
     Wired to /predict's `prompt_version` query param. That param is
     deliberately never logged -- see the logging call below. See
@@ -594,14 +623,14 @@ def explain(
     if not client.configured:
         return _fallback_explanation(request_dict, predictions, shap, explanation_units)
 
-    # v2/v3/v4 all share the v2 template; they differ only in how many
-    # features they cover and whether length is capped.
-    #   v2 -- top 5, no word limit      v3 -- top 3, no word limit
-    #   v4 -- top 3, concise (~50-70 words)
+    # v2 and v3 share one template and differ only in length and how much
+    # causal reasoning is asked for -- both cover the top 5 features:
+    #   v2 -- ~80 words, values + why each moved the price
+    #   v3 -- no word limit, the most verbose form
     _V2_FAMILY = {
-        "v2": {"top_n": 5, "concise": False, "max_new_tokens": 1500},
-        "v3": {"top_n": 3, "concise": False, "max_new_tokens": 1500},
-        "v4": {"top_n": 3, "concise": True, "max_new_tokens": 400},
+        # ~80 words, so 600 tokens is generous headroom.
+        "v2": {"top_n": 5, "concise": True, "max_new_tokens": 600},
+        "v3": {"top_n": 5, "concise": False, "max_new_tokens": 1500},
     }
     if prompt_version in _V2_FAMILY:
         cfg = _V2_FAMILY[prompt_version]
