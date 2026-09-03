@@ -154,7 +154,10 @@ class Script21Pipeline:
             "route": route,
         }
 
-        if explain or (k_pos > 0 or k_neg > 0):
+        # k != 0 rather than k > 0: a negative k means "all features"
+        # (see collapse_engineered_to_raw), so only an explicit 0 on BOTH
+        # sides means the caller wants no SHAP work done at all.
+        if explain or (k_pos != 0 or k_neg != 0):
             shap_payload = compute_user_shap_payload(
                 model=models[shap_quantile],
                 X_row=X,

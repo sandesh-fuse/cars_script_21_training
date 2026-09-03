@@ -18,6 +18,29 @@ provenance for debugging.
 
 from typing import List, Dict, Any, Optional
 
+# Raw keys never shown to users, however large their SHAP attribution.
+#
+# 'Specialty Item': specialty vehicles (RV/boat/heavy equipment) are dropped
+# from training entirely (see the Specialty-item filter in
+# train_save_script21.py / train_save_script17.py), so this column carries no
+# vehicle signal by construction. What survived training was a MIX of rows
+# where the source export wrote an explicit "false" (encoded 0) and rows where
+# it left the field blank (encoded -1, the unknown sentinel) -- roughly 6% vs
+# 94%. The models therefore split on it ~278 times (standard) / ~95 (cult)
+# purely to separate "field was populated" from "field was blank", i.e. on
+# data provenance, not on anything about the car.
+#
+# It is also unreachable at serving time: `speciality_item` is not a
+# PredictRequest field and the schema is extra="forbid", so the column is
+# always absent and encodes to NaN -- a third value that appears nowhere in
+# training, which every tree routes to the ~6% branch. SHAP consequently
+# hands it a real, non-zero dollar impact and it surfaces as a user-facing
+# "reason" that is pure train/serve skew.
+#
+# Hiding it here is a DISPLAY fix only -- the model still uses the feature to
+# produce the number. The real fix is retraining with the column excluded.
+HIDDEN_RAW_KEYS = frozenset({"Specialty Item"})
+
 from preprocessor import describe_picklist_value, describe_other_damages_value
 
 
@@ -36,7 +59,13 @@ BUCKET_UNKNOWNS = ("__unknowns",          "How many condition fields are unknown
 BUCKET_MECH     = ("__mechanical",        "Overall mechanical condition")
 BUCKET_TIME     = ("__time_of_sale",      "Time of sale (day/month/season)")
 BUCKET_ENGINE   = ("__engine_specs",      "Engine specifications")
-BUCKET_CLUSTER  = ("__vehicle_profile",   "Vehicle profile group")
+# Label, not key: the key is part of the /predict response contract
+# (feature_raw_key), so renaming it would break consumers. "Vehicle profile
+# group" told users nothing -- this is a K-means grouping of (make, model)
+# pairs by shared attributes (age, mileage, condition, body type) and
+# explicitly NOT by price, so what it really means to a reader is "cars like
+# this one". See _fit_vehicle_profile_clusters() in preprocessor.py.
+BUCKET_CLUSTER  = ("__vehicle_profile",   "Similar vehicles (make/model group)")
 # Add alongside other BUCKET_ definitions:
 BUCKET_DAMAGE = ("__other_damages", "Reported damages")
 
@@ -300,7 +329,9 @@ def collapse_engineered_to_raw(
                        interleaved is fine; we will partition by sign).
     request_dict : original API request body. Used to pull raw values for display
                    (so we show "Runs & Drives" instead of severity-encoded "1").
-    k_pos, k_neg : how many raw groups to return for each side.
+    k_pos, k_neg : how many raw groups to return for each side. A negative
+                   value means "all groups on this side" (see the
+                   normalization at the top of the body).
     look_factor : how many K-multiples of engineered features to consider before
                   collapsing. look_factor=2 means we examine top 2K engineered
                   features per side, then collapse, then return top K raw groups.
@@ -330,6 +361,48 @@ def collapse_engineered_to_raw(
     sorted_recs = sorted(feature_records,
                          key=lambda r: r.get('dollar_impact_marginal', 0.0),
                          reverse=True)
+
+    # A negative k means "return every group on this side" -- the documented
+    # meaning of /predict's k_pos=-1 / k_neg=-1. This MUST be normalized
+    # before either slice below: both `[:look_factor * k]` and `[:k]` are
+    # plain Python slices, and a negative k there silently means "all but
+    # the last N" -- the opposite of "all". Left unnormalized, k=-1 trimmed
+    # the pool to [:-2] and the result to [:-1], which collapsed to an empty
+    # list, so -1 behaved identically to 0 and returned nothing at all.
+    #
+    # len(sorted_recs) is the count of ENGINEERED records, which is always
+    # >= the number of collapsed raw groups, so it disables both slices
+    # without needing to know the post-collapse count up front.
+    if k_pos < 0:
+        k_pos = len(sorted_recs)
+    if k_neg < 0:
+        k_neg = len(sorted_recs)
+
+    # Drop hidden keys BEFORE the pool slice below, not after the top-K cut:
+    # filtering afterwards would silently return K-1 groups whenever a hidden
+    # feature landed in the top K, and would also let it consume pool budget.
+    sorted_recs = [r for r in sorted_recs
+                   if _resolve_raw(r['feature'])[0] not in HIDDEN_RAW_KEYS]
+
+    # raw_key -> the value the model actually saw, for engineered features
+    # named EXACTLY like their raw key. Such a feature IS the raw input, so
+    # its recorded value is the one to display when request_dict has nothing
+    # (e.g. 'age' = record_year - year, computed inside the preprocessor and
+    # therefore never present in the request body).
+    #
+    # Built here, over ALL records, rather than inside _collapse: the positive
+    # and negative pools are collapsed independently, so a group appearing on
+    # both sides would otherwise only get its value on whichever side happened
+    # to contain the self-named record.
+    #
+    # Restricted to self-named features on purpose: the 'make' group also
+    # holds make_freq / make_tgt_enc, whose values are encoded frequencies,
+    # NOT the make -- displaying those would be actively wrong.
+    self_named_values = {
+        r['feature']: r.get('value')
+        for r in sorted_recs
+        if _resolve_raw(r['feature'])[0] == r['feature']
+    }
 
     # Take top look_factor*K from each end
     pos_pool = [r for r in sorted_recs if r.get('dollar_impact_marginal', 0.0) > 0][:look_factor * k_pos]
@@ -376,6 +449,11 @@ def collapse_engineered_to_raw(
                         # -- so the lookup above always misses. Surface the
                         # pipeline's actual computed value here instead.
                         raw_val = _format_value(is_cult)
+                    elif raw_key in self_named_values:
+                        # No request value, but the model computed this input
+                        # itself -- show what it actually used. See
+                        # self_named_values above.
+                        raw_val = _format_value(self_named_values[raw_key])
 
                 groups[group_key] = {
                     'feature_raw_key':  raw_key or r['feature'],

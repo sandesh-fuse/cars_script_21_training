@@ -374,8 +374,18 @@ def predict(
     shap_quantile: str = Query(
         "p50", pattern="^(p5|p50|p95)$", description="Which quantile's SHAP to compute"
     ),
-    k_pos: int = Query(5, ge=-1, le=20, description="Top-K positive SHAP features"),
-    k_neg: int = Query(5, ge=-1, le=20, description="Top-K negative SHAP features"),
+    k_pos: int = Query(
+        5,
+        ge=-1,
+        le=20,
+        description="Top-K positive SHAP features; -1 returns all available",
+    ),
+    k_neg: int = Query(
+        5,
+        ge=-1,
+        le=20,
+        description="Top-K negative SHAP features; -1 returns all available",
+    ),
     explanation_units: str = Query(
         "both",
         pattern="^(both|percentage|dollar)$",

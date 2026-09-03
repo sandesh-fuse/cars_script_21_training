@@ -73,10 +73,19 @@ call.
 |---|---|---|---|
 | `explain` | bool | `false` | If `true`, also generates a natural-language explanation of the prediction. Adds noticeable latency (see [Performance](#performance)). |
 | `shap_quantile` | string | `p50` | Which prediction (`p5`, `p50`, or `p95`) the returned feature attributions explain. |
-| `k_pos` | int | `5` | Max number of positive (value-increasing) feature attributions to return. `-1`–`20`, where `-1` returns all available. |
-| `k_neg` | int | `5` | Max number of negative (value-decreasing) feature attributions to return. `-1`–`20`, where `-1` returns all available. |
+| `k_pos` | int | `5` | Max number of positive (value-increasing) feature attributions to return. `0`–`20`, or `-1` for all (see note below). |
+| `k_neg` | int | `5` | Max number of negative (value-decreasing) feature attributions to return. `0`–`20`, or `-1` for all (see note below). |
 | `explanation_units` | string | `both` | Units used inside the natural-language explanation text: `dollar`, `percentage`, or `both`. Only relevant when `explain=true`. |
 | `prompt_version` | string | `v1` | Which prompt template generates the explanation — see the table below. Only relevant when `explain=true`. **Which version served a request is not recorded in logs.** |
+
+> **`k_pos`/`k_neg` are not a simple truncation.** Attributions are collapsed
+> from engineered features into raw groups, and only the top `2K` engineered
+> features are pooled *before* that collapse. Since collapsing sums each
+> group's contributions, a larger `K` can change both the dollar amounts and
+> the ordering — a top-5 result is not the first 5 rows of a top-20 result.
+> `-1` disables the pool limit entirely, so it is the only complete and
+> fully-summed view. `20` is a cap, not "everything": for a typical vehicle
+> it yields ~17 groups while `-1` yields ~23.
 
 #### `prompt_version` options
 

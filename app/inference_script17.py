@@ -105,7 +105,10 @@ class Script17Pipeline:
             "route": "quick_blend",
         }
 
-        if explain or (k_pos > 0 or k_neg > 0):
+        # k != 0 rather than k > 0: a negative k means "all features"
+        # (see collapse_engineered_to_raw), so only an explicit 0 on BOTH
+        # sides means the caller wants no SHAP work done at all.
+        if explain or (k_pos != 0 or k_neg != 0):
             # 1. Extract calculated values from the preprocessor output
             if hasattr(X_te, "iloc"):
                 calc_vals = X_te.iloc[0].values
