@@ -184,7 +184,12 @@ HUMAN_READABLE = {
     # Original pass-through columns missing a label (always present)
     'Specialty Item':               'Flagged as a specialty item (RV/boat/heavy equipment)',
     'all_clean_notes':              'Donor/pickup notes',
-    'vstate_name':                  'State (from title/registration)',
+    # Plain "State" on purpose: this is the vehicle's own state
+    # (state_picklist_id), distinct from state_province_of_title's "State
+    # of title" (state_title_picklist). The old label mentioned title and
+    # registration, which read as the same thing as that other group --
+    # they coincide on most vehicles but are genuinely separate inputs.
+    'vstate_name':                  'State',
     'accessiblefortwotruck':        'Accessible for tow truck',
     'locatedatdonationca':          'Located at donation center',
 }
