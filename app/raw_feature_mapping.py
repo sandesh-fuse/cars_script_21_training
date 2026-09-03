@@ -132,7 +132,7 @@ EXACT_MAP: Dict[str, tuple] = {
     'n_unknowns':             BUCKET_UNKNOWNS,
     'all_unknown':            BUCKET_UNKNOWNS,
     'any_unknown':            BUCKET_UNKNOWNS,
-    'old_and_unknown':        ('age',     'Vehicle age (years)'),
+    'old_and_unknown':        ('year',         'Model year / vehicle age'),
 
     # --- Mechanical aggregates ---
     'mechanical_severity_sum':   BUCKET_MECH,
@@ -140,18 +140,40 @@ EXACT_MAP: Dict[str, tuple] = {
     'mechanical_severity_max':   BUCKET_MECH,
 
     # --- Severity encodings (numeric form of condition categorical) ---
+    # engine/transmission/tire fold into __mechanical rather than standing
+    # alone: mechanical_severity_{sum,mean,max} ARE the aggregate of exactly
+    # these three, so a group per component counted the same fault twice --
+    # a bad engine showed as BOTH "Overall mechanical condition -$44" AND
+    # "Engine condition -$48", inviting a reader to add them. __mechanical's
+    # value already spells out each component ("Engine: Major Malfunction,
+    # Transmission: Operational, Tires: ..."), so merging de-duplicates
+    # without hiding anything. nav/body/interior severity are NOT in
+    # mech_parts and keep their own groups.
+    #
+    # age likewise folds into 'year': age is record_year - year, the SAME
+    # fact, and as separate groups they read as two independent reasons
+    # (+$458 for the model year AND +$148 for the age of that same car).
+    # 'year' wins the key because it is the field the caller actually sends.
     'nav_severity':           ('nav_condition',         'Driveability condition'),
     'body_severity':          ('bodypaintcondition',    'Body/paint condition'),
-    'engine_severity':        ('enginecondition',       'Engine condition'),
-    'trans_severity':         ('transmissioncondition', 'Transmission condition'),
-    'tire_severity':          ('tirecondition',         'Tire/wheel condition'),
+    'engine_severity':        BUCKET_MECH,
+    'trans_severity':         BUCKET_MECH,
+    'tire_severity':          BUCKET_MECH,
+    # The bare columns too, not just their severity encodings -- otherwise
+    # 'enginecondition' still forms its own group via HUMAN_READABLE.
+    'enginecondition':        BUCKET_MECH,
+    'transmissioncondition':  BUCKET_MECH,
+    'tirecondition':          BUCKET_MECH,
+    # An explicit 'year' entry so HUMAN_READABLE's plain 'Model year' label
+    # doesn't win over the merged label above.
+    'year':                   ('year',         'Model year / vehicle age'),
     'interior_severity':      ('interiorcondition',     'Interior condition'),
     'runs_flag':              ('nav_condition',         'Driveability condition'),
 
     # --- Bucketing/transformation of single raw feature ---
-    'age':                    ('age',          'Vehicle age (years)'),
-    'age_sq':                 ('age',          'Vehicle age (years)'),
-    'age_bucket':             ('age',          'Vehicle age (years)'),
+    'age':                    ('year',         'Model year / vehicle age'),
+    'age_sq':                 ('year',         'Model year / vehicle age'),
+    'age_bucket':             ('year',         'Model year / vehicle age'),
     'mileage':                ('mileage',      'Mileage (miles driven)'),
     'mileage_bucket':         ('mileage',      'Mileage (miles driven)'),
     'miles_per_year':         ('mileage',      'Mileage (miles driven)'),
@@ -178,7 +200,7 @@ EXACT_MAP: Dict[str, tuple] = {
     'vtype_x_nav_condition':  ('nav_condition','Driveability condition'),
     'body_x_drive':           ('body_type',    'Body type'),
     'condition_combo':        ('nav_condition','Driveability condition'),
-    'engine_x_trans_cond':    ('enginecondition','Engine condition'),
+    'engine_x_trans_cond':    BUCKET_MECH,
     'nav_cond_x_age_bkt':     ('nav_condition','Driveability condition'),
     'runs_x_mileage_bkt':     ('mileage',      'Mileage (miles driven)'),
     'all_cond_combo':         ('nav_condition','Driveability condition'),
@@ -186,7 +208,7 @@ EXACT_MAP: Dict[str, tuple] = {
     'make_x_age':             ('make',         'Make'),
     'month_x_age':            BUCKET_TIME,
     'mileage_x_age':          ('mileage',      'Mileage (miles driven)'),
-    'year_x_dow':             ('year',         'Model year'),
+    'year_x_dow':             ('year',         'Model year / vehicle age'),
     'zip_region_x_mileage_bkt': BUCKET_LOCATION,
     'quarter_x_make':         ('make',         'Make'),
 
@@ -349,6 +371,27 @@ def _request_value(request_dict: Dict, internal_key: str) -> Any:
         return request_dict[internal_key]
     request_field = INTERNAL_TO_REQUEST_FIELD.get(internal_key)
     return request_dict.get(request_field) if request_field else None
+
+
+def _is_caller_field(request_dict: Dict, internal_key: str) -> bool:
+    """True when internal_key names a field the CALLER can supply.
+
+    Presence of the key is what matters, not its value: /predict dumps the
+    body with exclude_none=False, so every declared PredictRequest field is
+    present even when the caller left it out -- present-and-None means "the
+    caller could have sent this and didn't".
+
+    Used to keep the self-named fallback in _collapse() away from fields the
+    caller owns. 'age' is computed inside the preprocessor and appears in no
+    request body, so it legitimately falls back to the value the model saw;
+    'trim'/'body_subtype'/'body_type' are request fields, and falling back
+    for those surfaced the int-map's internal "unknown" sentinel (-1) as if
+    it were the caller's answer.
+    """
+    if internal_key in request_dict:
+        return True
+    alias = INTERNAL_TO_REQUEST_FIELD.get(internal_key)
+    return bool(alias) and alias in request_dict
 
 
 # ============================================================
@@ -684,9 +727,22 @@ def collapse_engineered_to_raw(
                                 feature_values=feature_values,
                                 is_cult=is_cult)
 
-    # Take top look_factor*K from each end
-    pos_pool = [r for r in sorted_recs if r.get('dollar_impact_marginal', 0.0) > 0][:look_factor * k_pos]
-    neg_pool = list(reversed([r for r in sorted_recs if r.get('dollar_impact_marginal', 0.0) < 0]))[:look_factor * k_neg]
+    # ALL records collapse together into ONE set of groups, rather than the
+    # positive and negative halves being pooled and collapsed separately.
+    #
+    # Two bugs died with that split. First, a raw feature whose engineered
+    # members pulled in both directions appeared in BOTH lists -- 'make' came
+    # back as +$4.51 AND -$152.54 for the same car, two contradictory answers
+    # to "is this make good or bad?" when the honest answer is the net,
+    # -$148. Second, `[:look_factor * k]` truncated the pool BEFORE the
+    # collapse, and since collapsing SUMS a group's members, a group's dollar
+    # amount changed with k -- a top-5 result was not the first five rows of
+    # a top-20 result. Summing every member exactly once fixes both: the
+    # numbers are now stable whatever k is, and k only decides how many rows
+    # come back.
+    #
+    # look_factor is kept in the signature for call-site compatibility but is
+    # no longer used; there is no pool to widen when nothing is truncated.
 
     def _collapse(pool: List[Dict]) -> List[Dict]:
         # group by raw key
@@ -724,10 +780,18 @@ def collapse_engineered_to_raw(
                         # of -- see BUCKET_VALUE_RESOLVERS.
                         raw_val = _format_value(
                             BUCKET_VALUE_RESOLVERS[raw_key](bucket_ctx))
-                    elif raw_key in self_named_values:
-                        # No request value, but the model computed this input
-                        # itself -- show what it actually used. See
-                        # self_named_values above.
+                    elif (raw_key in self_named_values
+                          and not _is_caller_field(request_dict, raw_key)):
+                        # No request value AND not a field the caller could
+                        # have sent, so the model must have computed this
+                        # input itself -- show what it actually used ('age').
+                        #
+                        # The _is_caller_field guard is essential: without it
+                        # a declared request field left null fell through to
+                        # here and rendered the int-map's internal "unknown"
+                        # sentinel, so `"trim": null` came back as
+                        # `"value": "-1"`. A field the caller owns and left
+                        # blank is "Not provided", never an encoding.
                         raw_val = _format_value(self_named_values[raw_key])
 
                 # Never emit null: a bare null reads as a bug to a
@@ -760,13 +824,15 @@ def collapse_engineered_to_raw(
             g.pop('_top_abs', None)
         return list(groups.values())
 
-    pos_groups = _collapse(pos_pool)
-    neg_groups = _collapse(neg_pool)
+    all_groups = _collapse(sorted_recs)
 
-    # After summing, a group might cross zero — keep only those still on the right side
-    pos_groups = [g for g in pos_groups if g['dollar_impact'] > 0]
-    neg_groups = [g for g in neg_groups if g['dollar_impact'] < 0]
+    # Split by the sign of the NET impact -- a group lands in exactly one list.
+    pos_groups = [g for g in all_groups if g['dollar_impact'] > 0]
+    neg_groups = [g for g in all_groups if g['dollar_impact'] < 0]
 
+    # Sort on the FULL-PRECISION sums, before the rounding below: rounding
+    # first would collapse near-ties to the same 2dp value and order them
+    # arbitrarily.
     pos_groups.sort(key=lambda g: g['dollar_impact'], reverse=True)
     neg_groups.sort(key=lambda g: g['dollar_impact'])
 
@@ -778,6 +844,19 @@ def collapse_engineered_to_raw(
     for g in pos_groups + neg_groups:
         g['dollar_impact'] = round(g['dollar_impact'], 2)
         g['pct_of_prediction'] = round(g['pct_of_prediction'], 2)
+
+    # Drop anything not on the right side of zero, AFTER rounding. Two things
+    # get caught here, and the order matters:
+    #   - a group whose members' contributions cancelled out and crossed zero
+    #     while being summed;
+    #   - a group whose impact is real but smaller than a cent, e.g.
+    #     0.0004 -- it passes an unrounded `> 0` test and then renders as
+    #     "dollar_impact": 0.0, which reads to a user as "this changed
+    #     nothing, so why is it listed?".
+    # Rounding before the test folds the second case into the first: -0.0 < 0
+    # is False in Python, so a negative sub-cent value is dropped too.
+    pos_groups = [g for g in pos_groups if g['dollar_impact'] > 0]
+    neg_groups = [g for g in neg_groups if g['dollar_impact'] < 0]
 
     return {
         'top_positive': pos_groups[:k_pos],

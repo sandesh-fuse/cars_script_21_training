@@ -78,14 +78,17 @@ call.
 | `explanation_units` | string | `both` | Units used inside the natural-language explanation text: `dollar`, `percentage`, or `both`. Only relevant when `explain=true`. |
 | `prompt_version` | string | `v1` | Which prompt template generates the explanation — see the table below. Only relevant when `explain=true`. **Which version served a request is not recorded in logs.** |
 
-> **`k_pos`/`k_neg` are not a simple truncation.** Attributions are collapsed
-> from engineered features into raw groups, and only the top `2K` engineered
-> features are pooled *before* that collapse. Since collapsing sums each
-> group's contributions, a larger `K` can change both the dollar amounts and
-> the ordering — a top-5 result is not the first 5 rows of a top-20 result.
-> `-1` disables the pool limit entirely, so it is the only complete and
-> fully-summed view. `20` is a cap, not "everything": for a typical vehicle
-> it yields ~17 groups while `-1` yields ~23.
+> **`k_pos`/`k_neg` only control how many rows come back.** Every engineered
+> feature is collapsed into its raw group and summed exactly once, so a
+> group's `dollar_impact` is the same whatever `K` you ask for, and a top-5
+> result is exactly the first 5 rows of a top-20 result. Use `-1` for the
+> full list; `20` is a cap, not "everything", so for a vehicle with more
+> groups than that `-1` returns more rows.
+>
+> Each raw feature appears **once**, in either `top_positive` or
+> `top_negative`, carrying the net of its engineered contributions. A feature
+> whose parts pull in both directions is reported by its net effect rather
+> than appearing in both lists.
 
 #### `prompt_version` options
 
@@ -199,8 +202,8 @@ Send an array of such objects to score a batch in one call.
 | `predictions.low` | number | Low end of the 90% confidence range (5th percentile). |
 | `predictions.predicted_price` | number | Point estimate (median / 50th percentile). Use this as "the" prediction. |
 | `predictions.high` | number | High end of the 90% confidence range (95th percentile). |
-| `feature_importances.top_positive` | array | Features that pushed the value **up**, largest first. Omitted/empty if `k_pos=0`. |
-| `feature_importances.top_negative` | array | Features that pushed the value **down**, largest first. Omitted/empty if `k_neg=0`. |
+| `feature_importances.top_positive` | array | Raw features whose **net** effect pushed the value up, largest first. Omitted/empty if `k_pos=0`. |
+| `feature_importances.top_negative` | array | Raw features whose **net** effect pushed the value down, largest first. Omitted/empty if `k_neg=0`. |
 | `explanation` | string or null | Natural-language summary of the prediction. Only present when `explain=true` was passed. |
 
 Each entry in `top_positive` / `top_negative`:
