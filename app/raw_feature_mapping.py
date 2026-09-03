@@ -290,6 +290,7 @@ def collapse_engineered_to_raw(
     k_pos: int = 5,
     k_neg: int = 5,
     look_factor: int = 2,
+    is_cult: Optional[bool] = None,
 ) -> Dict[str, List[Dict]]:
     """Collapse engineered SHAP attributions to raw features for user-facing display.
 
@@ -303,6 +304,16 @@ def collapse_engineered_to_raw(
     look_factor : how many K-multiples of engineered features to consider before
                   collapsing. look_factor=2 means we examine top 2K engineered
                   features per side, then collapse, then return top K raw groups.
+    is_cult : the pipeline's already-computed cult/collectible flag for this
+              request (Script21Pipeline.predict()'s `is_cult`, derived from
+              preprocessor.compute_cult_flag() -- see app/inference_script21.py).
+              request_dict can NEVER supply this on its own: it's a value the
+              pipeline computes from make/model/year, not a field the caller
+              sent, so the BUCKET_CULT group's normal request_dict lookup below
+              always misses. Passed in separately purely so the '__collectible'
+              group can carry a real value (e.g. "yes"/"no") instead of always
+              being null. Script17 has no cult routing and passes None here,
+              which keeps its '__collectible' value null as before.
 
     Returns
     -------
@@ -359,6 +370,12 @@ def collapse_engineered_to_raw(
                         else:
                             val = describe_picklist_value(raw_key, val)
                         raw_val = _format_value(val)
+                    elif raw_key == BUCKET_CULT[0] and is_cult is not None:
+                        # '__collectible' never maps to a raw request field --
+                        # it's a computed flag, not something the caller sent
+                        # -- so the lookup above always misses. Surface the
+                        # pipeline's actual computed value here instead.
+                        raw_val = _format_value(is_cult)
 
                 groups[group_key] = {
                     'feature_raw_key':  raw_key or r['feature'],

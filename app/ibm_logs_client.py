@@ -4,14 +4,31 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
 
+# The endpoints this service logs against, and therefore the only values
+# /logs can be filtered by. It lives here rather than in schemas.py because
+# this module builds the DataPrime query AND has to keep working when run
+# directly (`python app/ibm_logs_client.py` puts app/ on sys.path, not the
+# repo root, so it could not import app.schemas). schemas.py imports this
+# tuple for its allowlist validator instead of restating the values: an
+# allowlist that drifted from this default would fail silently -- an
+# accepted endpoint the default query never includes just returns zero
+# rows, with no error anywhere.
+#
+# /models is deliberately absent: it does no logging at all, so filtering
+# on it could only ever return an empty list.
+LOG_QUERY_ENDPOINTS = ("/predict", "/healthz", "/logs")
+
+
 async def fetch_and_format_logs(
     api_key: str,
-    stock_id: Optional[str] = None,
+    stock_id: Optional[Union[str, List[str]]] = None,
+    endpoint: Optional[Union[str, List[str]]] = None,
+    request_id: Optional[Union[str, List[str]]] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
     days_ago: Optional[int] = 7,
@@ -28,11 +45,74 @@ async def fetch_and_format_logs(
     if not instance_id:
         raise ValueError("IBM_LOGS_INSTANCE_ID environment variable is missing.")
 
-    # Updated query to match your current app's logger and endpoints
-    query = "source logs | filter $l.subsystemname == 'car-resale-api' | filter $d.endpoint == '/predict'|| $d.endpoint == '/healthz' || $d.endpoint == '/logs'"
+    # Each filter below gets its OWN `| filter` pipeline stage. Stages are
+    # ANDed implicitly, so the `||`s inside one stage can never bleed into
+    # another -- no parenthesisation or operator-precedence juggling is
+    # needed to combine "any of these endpoints" with "any of these stock
+    # IDs" with "any of these request IDs".
+    #
+    # An unspecified endpoint falls back to every known endpoint, which
+    # reproduces the previously hardcoded 3-way OR exactly. Dropping the
+    # filter entirely would NOT be equivalent: the same subsystem also
+    # emits startup and uvicorn lines that carry no $d.endpoint at all, and
+    # those would suddenly start appearing in /logs output.
+    #
+    # The values are interpolated unescaped because they cannot be
+    # caller-controlled: LogsQueryRequest validates them against
+    # LOG_QUERY_ENDPOINTS, so every string reaching this f-string is one of
+    # our own constants. That is a stronger guarantee than the character
+    # denylist stock_id relies on below.
+    endpoints = (
+        [endpoint] if isinstance(endpoint, str) else list(endpoint or LOG_QUERY_ENDPOINTS)
+    )
+    unknown = [ep for ep in endpoints if ep not in LOG_QUERY_ENDPOINTS]
+    if unknown:
+        # Belt and braces: LogsQueryRequest is the gate for HTTP callers and
+        # gives them a friendly 422, but this function is also called
+        # directly (see __main__ below), and the interpolation above assumes
+        # allowlisted values.
+        raise ValueError(f"Unknown endpoint(s) for log query: {unknown}")
+
+    endpoint_clauses = " || ".join(f"$d.endpoint == '{ep}'" for ep in endpoints)
+    query = (
+        "source logs | filter $l.subsystemname == 'car-resale-api'"
+        f" | filter {endpoint_clauses}"
+    )
 
     if stock_id:
-        query += f" | filter $d.input_stock_ids.contains('{stock_id}')"
+        # input_stock_ids is logged as a JSON array (app/main.py always wraps
+        # it in a list, even for single-item requests), so array membership
+        # must be checked with arrayContains -- the string .contains() method
+        # used here previously caused a type-mismatch 400 from the DataPrime
+        # query engine whenever it matched a row.
+        #
+        # arrayContains takes one element, not a list, so multiple requested
+        # IDs are ORed together as separate arrayContains(...) filters --
+        # matches a log row containing ANY of the given stock IDs.
+        stock_ids = [stock_id] if isinstance(stock_id, str) else list(stock_id)
+        contains_clauses = " || ".join(
+            f"$d.input_stock_ids.arrayContains('{sid}')" for sid in stock_ids
+        )
+        query += f" | filter {contains_clauses}"
+
+    if request_id:
+        # Scalar equality, NOT arrayContains: request_id is a plain string
+        # on the log record (one id per HTTP request), unlike
+        # input_stock_ids which is always a JSON array. Using arrayContains
+        # here would be the same type-mismatch 400 that .contains() on
+        # input_stock_ids caused.
+        #
+        # Interpolated unescaped because LogsQueryRequest constrains these
+        # to UUID format -- hex digits and dashes only, nothing that can
+        # break out of the surrounding string literal.
+        request_ids = (
+            [request_id] if isinstance(request_id, str) else list(request_id)
+        )
+        request_id_clauses = " || ".join(
+            f"$d.request_id == '{rid}'" for rid in request_ids
+        )
+        query += f" | filter {request_id_clauses}"
+
     if limit:
         query += f" | limit {limit}"
 
@@ -128,21 +208,25 @@ async def fetch_and_format_logs(
                                     "message", user_data.get("log", "")
                                 ).strip()
 
-                                endpoint = user_data.get("endpoint", "N/A")
+                                # entry_-prefixed, not endpoint/request_id:
+                                # this function now takes filter parameters
+                                # by both those names, which loop-locals of
+                                # the same name would silently overwrite.
+                                entry_endpoint = user_data.get("endpoint", "N/A")
                                 client_ip = user_data.get("client_ip", "N/A")
                                 user_id = user_data.get("user_id", "N/A")
-                                model_version = user_data.get("model_version", "N/A")
+                                entry_request_id = user_data.get("request_id", "N/A")
 
                                 if (
                                     "Prediction" in base_message
                                     and "requested" in base_message
                                 ):
-                                    display_title = f"INCOMING REQUEST: API Prediction ({model_version})"
+                                    display_title = "INCOMING REQUEST: API Prediction"
                                 elif (
                                     "Prediction" in base_message
                                     and "completed" in base_message
                                 ):
-                                    display_title = f"SUCCESS: Prediction Completed ({model_version})"
+                                    display_title = "SUCCESS: Prediction Completed"
                                 elif (
                                     log_level in ["ERROR", "WARNING"]
                                     or "Exception" in base_message
@@ -155,9 +239,16 @@ async def fetch_and_format_logs(
                                     "timestamp": timestamp,
                                     "level": log_level,
                                     "title": display_title,
-                                    "endpoint": endpoint,
+                                    "endpoint": entry_endpoint,
                                     "client_ip": client_ip,
                                     "user_id": user_id,
+                                    # Same UUID the request's X-Request-ID
+                                    # header and /predict response body
+                                    # carry -- it is the join key between a
+                                    # caller's bug report and these logs,
+                                    # and what the request_id filter above
+                                    # matches on.
+                                    "request_id": entry_request_id,
                                 }
 
                                 # ==========================================

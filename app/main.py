@@ -5,6 +5,7 @@ FastAPI service exposing /predict for both Script 17 and Script 21 pipelines.
 
 Endpoint:
     POST /predict?model={script17|script21}&explain={true|false}&shap_quantile={p5|p50|p95}&k_pos=N&k_neg=N
+         &explanation_units={both|percentage|dollar}&prompt_version={v1|v2|v3|v4}
 
 Request body (JSON): car attributes — see schemas.PredictRequest.
 
@@ -380,6 +381,18 @@ def predict(
         pattern="^(both|percentage|dollar)$",
         description="Format for explanation impacts",
     ),
+    prompt_version: str = Query(
+        "v1",
+        pattern="^(v1|v2|v3|v4)$",
+        description=(
+            "Which Granite prompt template generates the explanation. "
+            "v1 (default): top 5 features, 40-60 words, no per-feature "
+            "context. v2: top 5, no length limit, adds plain-English "
+            "context per feature. v3: top 3, no length limit. v4: top 3, "
+            "concise (~50-70 words). Feature counts are ceilings capped by "
+            "k_pos/k_neg. Only relevant when explain=true."
+        ),
+    ),
 ):
     req_id = getattr(request.state, "request_id", "unknown")
     user_id = auth_info["user_id"]
@@ -490,6 +503,7 @@ def predict(
                     route=pred_result.get("route"),
                     is_cult=pred_result.get("is_cult"),
                     explanation_units=explanation_units,
+                    prompt_version=prompt_version,
                 )
                 t_explain = (time.time() - t1) * 1000
                 total_t_explain += t_explain
@@ -531,6 +545,7 @@ def predict(
 
             final_responses.append(
                 {
+                    "request_id": req_id,
                     "stock_id": stock_id,
                     "model_used": model,
                     "is_cult": pred_result.get("is_cult"),
@@ -632,6 +647,10 @@ async def get_application_logs(
                 "client_ip": client_ip,
                 "query_limit": payload.limit,
                 "query_stock_id": payload.stock_id,
+                "query_endpoint": payload.endpoint,
+                # NOT req_id above: that is THIS call's own id, whereas this
+                # is the id being searched for. Two different things.
+                "query_request_id": payload.request_id,
             },
         )
 
@@ -639,6 +658,8 @@ async def get_application_logs(
         logs_payload = await fetch_and_format_logs(
             api_key=ibm_api_key,
             stock_id=payload.stock_id,
+            endpoint=payload.endpoint,
+            request_id=payload.request_id,
             start_time=payload.start_time,
             end_time=payload.end_time,
             days_ago=payload.days_ago,
@@ -660,7 +681,7 @@ async def get_application_logs(
             },
         )
 
-        return logs_payload
+        return {**logs_payload, "request_id": req_id}
 
     except Exception as e:
         logger.error(

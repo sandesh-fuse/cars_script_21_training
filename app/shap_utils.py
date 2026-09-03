@@ -86,7 +86,7 @@ def compute_shap_payload(model, X_row, feature_names, model_key, qlabel,
 
 
 def compute_user_shap_payload(model, X_row, feature_names, model_key, qlabel,
-                                request_dict, k_pos=5, k_neg=5):
+                                request_dict, k_pos=5, k_neg=5, is_cult=None):
     """User-facing SHAP payload: collapses engineered features back to raw inputs.
 
     Computes SHAP for ALL engineered features, then groups them by their raw
@@ -94,7 +94,12 @@ def compute_user_shap_payload(model, X_row, feature_names, model_key, qlabel,
     impacts per group, and returns the top-K positive/negative raw groups.
 
     Raw values come from request_dict (so the user sees "Runs & Drives" rather
-    than the encoded integer the model uses internally).
+    than the encoded integer the model uses internally). `is_cult` is a rare
+    exception: it's the caller's already-computed cult/collectible flag
+    (Script21Pipeline only; script17 passes None), threaded through purely so
+    the '__collectible' group gets a real value instead of always being null
+    -- see collapse_engineered_to_raw's docstring for why request_dict itself
+    can't supply it.
     """
     shap_vals, base_log_value, log_pred, feature_values_row = \
         _compute_raw_shap_arrays(model, X_row, feature_names, model_key, qlabel)
@@ -115,6 +120,7 @@ def compute_user_shap_payload(model, X_row, feature_names, model_key, qlabel,
         request_dict=request_dict,
         k_pos=k_pos, k_neg=k_neg,
         look_factor=2,
+        is_cult=is_cult,
     )
 
     return {

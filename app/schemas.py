@@ -4,9 +4,19 @@ schemas.py
 Pydantic request/response models for the /predict endpoint.
 """
 
+import re
 from typing import Optional, List, Any, Dict, Union
 from pydantic import BaseModel, Field, model_validator, field_validator
 from datetime import datetime, timezone
+
+from app.ibm_logs_client import LOG_QUERY_ENDPOINTS
+
+# Canonical form emitted by str(uuid.uuid4()) in main.py's request-id
+# middleware -- the only shape a real request_id can have.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 # Fields whose real contract is "a number" -- 9 of these (all but zip) are
@@ -39,6 +49,29 @@ NUMERIC_PICKLIST_ID_FIELDS = (
     'state_picklist_id', 'state_title_picklist',
     'zip',
 )
+
+
+def _coerce_numeric_id(v, field_name):
+    """Shared scalar coercion for a single picklist-ID-shaped value: accept a
+    real number, or a numeric-looking string (a common JSON client quirk),
+    converting either to a float; reject anything else (genuine resolved
+    text, a bool, ...) with a clear ValueError. Used directly by
+    _require_numeric_id below for NUMERIC_PICKLIST_ID_FIELDS, and per-element
+    by _require_numeric_damage_ids for other_damage_pklist_id (which can also
+    be a list of these)."""
+    if isinstance(v, bool):
+        raise ValueError(f"{field_name} must be a number, not a boolean.")
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        try:
+            return float(s)
+        except ValueError:
+            raise ValueError(
+                f"{field_name} must be a number (e.g. 22968), not text ({v!r})."
+            )
+    raise ValueError(f"{field_name} must be a number, got {type(v).__name__}.")
 
 
 class PredictRequest(BaseModel):
@@ -87,13 +120,20 @@ class PredictRequest(BaseModel):
     consumed: preprocessor.py's _parse_other_damages() derives
     has_other_damage / n_other_damages / other_damages_normalized /
     per-damage-type indicator features from it, then drops the raw column.
-    Typed Optional[Union[str, int, float, List[Any]]] because that method
-    accepts several shapes: a bare numeric picklist ID (the new-schema
-    format — decoded via preprocessor.py's OTHER_DAMAGE_ID_TO_LABEL),
-    plain text ('mold, other*'), a JSON-encoded string of {'id','name'}
-    dicts (the training-data legacy format), or — per its own inline
-    comment covering live API callers specifically — an actual JSON list of
-    numeric picklist IDs, plain strings, or {'name': ...} dicts.
+    Now typed Optional[Union[int, float, List[Union[int, float]]]] and
+    validated by _require_numeric_damage_ids below, matching the numeric-
+    picklist-ID contract of NUMERIC_PICKLIST_ID_FIELDS above: a vehicle can
+    carry more than one damage type, so this field additionally accepts a
+    JSON array of numeric IDs, not just a single scalar. A resolved-text
+    value (e.g. "mold, other*") is rejected here with a 422 instead of
+    silently reaching preprocessor.py's parser as an unrecognized token --
+    same rationale as the other picklist-ID fields (project memory
+    script21-vehicle-type-color-picklist-bug). preprocessor.py's
+    _parse_other_damages() itself still accepts plain text and the legacy
+    JSON-encoded {'id','name'}-dict string format too, since it's also used
+    to ingest historical training data written before this migration --
+    only the live /predict request contract is restricted to numeric ID(s)
+    here.
 
     oem_body_style / drive_type / msrp are DataOne spec fields (see
     DATAONE_FEATURES in train_save_script21.py), gated by --use-dataone at
@@ -225,7 +265,7 @@ class PredictRequest(BaseModel):
     transmission_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: transmissioncondition
     tire_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: tirecondition
     interior_cond_picklist_id: Optional[Union[int, float]] = None  # legacy name: interiorcondition
-    other_damage_pklist_id: Optional[Union[str, int, float, List[Any]]] = None  # legacy name: other_damages
+    other_damage_pklist_id: Optional[Union[int, float, List[Union[int, float]]]] = None  # legacy name: other_damages
     comment: Optional[str] = None  # legacy name: all_clean_notes
 
     # Geo, Admin, and Flags
@@ -253,19 +293,25 @@ class PredictRequest(BaseModel):
         since zip is grouped in here too and isn't one."""
         if v is None:
             return v
-        if isinstance(v, bool):
-            raise ValueError(f"{info.field_name} must be a number, not a boolean.")
-        if isinstance(v, (int, float)):
+        return _coerce_numeric_id(v, info.field_name)
+
+    @field_validator("other_damage_pklist_id", mode="before")
+    @classmethod
+    def _require_numeric_damage_ids(cls, v):
+        """other_damage_pklist_id is a picklist-ID field like the ones in
+        NUMERIC_PICKLIST_ID_FIELDS above, except a vehicle can carry more
+        than one damage type -- so this field additionally accepts a JSON
+        array of numeric IDs, not just a single scalar. Each element goes
+        through the same number-or-numeric-string coercion as
+        _require_numeric_id; genuine text (a damage-type name instead of
+        its ID, e.g. "mold, other*") is rejected with a 422 rather than
+        silently reaching preprocessor.py's other-damages parser as an
+        unrecognized token."""
+        if v is None:
             return v
-        if isinstance(v, str):
-            s = v.strip()
-            try:
-                return float(s)
-            except ValueError:
-                raise ValueError(
-                    f"{info.field_name} must be a number (e.g. 22968), not text ({v!r})."
-                )
-        raise ValueError(f"{info.field_name} must be a number, got {type(v).__name__}.")
+        if isinstance(v, list):
+            return [_coerce_numeric_id(item, "other_damage_pklist_id") for item in v]
+        return _coerce_numeric_id(v, "other_damage_pklist_id")
 
     @field_validator("accessible_for_tow_truck", "located_at_donation_c_a", mode="before")
     @classmethod
@@ -319,6 +365,20 @@ class ShapPayload(BaseModel):
 
 class PredictResponse(BaseModel):
     # model_used: str
+    # The same UUID as the X-Request-ID response header, and the same value
+    # on every item of a batch response: it identifies the HTTP request, not
+    # the row (pair it with stock_id to point at a single row). Echoed in
+    # the body as well as the header because clients that keep only the
+    # parsed JSON -- and anyone pasting a response into a bug report --
+    # otherwise lose the join key needed to look the call up via /logs,
+    # where it is now also accepted as a filter.
+    #
+    # Optional rather than required so a future code path that forgets to
+    # set it degrades to a null field instead of turning a perfectly good
+    # prediction into a response-validation 500. (Pydantic v2's
+    # protected_namespaces warning only fires for "model_"-prefixed field
+    # names, so "request_id" needs no model_config change.)
+    request_id: Optional[str] = None
     stock_id: Optional[str] = None  # Add this line
     is_cult: Optional[bool] = None
     # route: Optional[str] = None
@@ -335,14 +395,106 @@ class LogsQueryRequest(BaseModel):
       - relative: days_ago and/or minutes_ago
       - absolute: start_time AND end_time (both required together)
     Mixing the two modes in one request is rejected.
+
+    Note the field names are start_time/end_time, NOT start_date/end_date --
+    the latter is IBM's own naming for the downstream metadata.start_date/
+    end_date sent in ibm_logs_client.py, easy to confuse with this field.
+    extra="forbid" below exists so that mix-up (or any other typo) gets a
+    clear 422 instead of being silently dropped and quietly falling back
+    to the default relative window.
     """
 
-    stock_id: Optional[str] = None
+    class Config:
+        extra = "forbid"
+
+    # A single ID (str) or several (list) -- fetch_and_format_logs ORs
+    # together one arrayContains(...) filter per ID in the latter case.
+    stock_id: Optional[Union[str, List[str]]] = None
+    # Optional endpoint filter: one path, or several. Left unset, the
+    # downstream query keeps its previous behaviour of returning all three
+    # endpoints, so existing callers see no change.
+    endpoint: Optional[Union[str, List[str]]] = None
+    # Optional request-id filter: one id, or several. Pairs with the
+    # request_id now returned in the /predict response body and the
+    # X-Request-ID header -- a caller quotes theirs, this pulls back every
+    # log line for that exact call.
+    request_id: Optional[Union[str, List[str]]] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     days_ago: Optional[int] = None
     minutes_ago: Optional[int] = None
     limit: Optional[int] = Field(default=200, ge=1, le=200)
+
+    @field_validator("stock_id")
+    @classmethod
+    def _reject_query_breaking_chars(cls, v):
+        # stock_id is spliced verbatim into a single-quoted DataPrime string
+        # literal in ibm_logs_client.py (`arrayContains('{sid}')`). A stray
+        # `'` closes that literal early and turns the rest of the value into
+        # live query syntax -- a DataPrime-injection analogue of SQL
+        # injection. Rather than guess at DataPrime's escape convention
+        # (unconfirmed, and untestable from here without live IBM creds),
+        # reject the character outright: no legitimate stock ID needs it.
+        if v is None:
+            return v
+        candidates = [v] if isinstance(v, str) else v
+        for sid in candidates:
+            if "'" in sid or "\\" in sid:
+                raise ValueError(
+                    f"stock_id {sid!r} contains a character (' or \\) that "
+                    "cannot be safely used in the downstream log query."
+                )
+        return v
+
+    @field_validator("endpoint")
+    @classmethod
+    def _restrict_to_known_endpoints(cls, v):
+        # Like stock_id, this value is spliced into a single-quoted
+        # DataPrime string literal ($d.endpoint == '{ep}'), but unlike
+        # stock_id it is drawn from a closed set the service itself defines
+        # -- so it gets an allowlist rather than stock_id's denylist of
+        # query-breaking characters. That is strictly stronger: a denylist
+        # only blocks the metacharacters we thought of (and we have no live
+        # DataPrime to confirm the full set), whereas an allowlist means the
+        # only strings that ever reach the query are constants from our own
+        # source, so the escaping question never arises. It also turns a
+        # typo like "/predicts" into an immediate 422 instead of a silently
+        # empty result set that reads like "no traffic".
+        if v is None:
+            return v
+        candidates = [v] if isinstance(v, str) else v
+        for ep in candidates:
+            if ep not in LOG_QUERY_ENDPOINTS:
+                raise ValueError(
+                    f"endpoint {ep!r} is not one of "
+                    f"{', '.join(LOG_QUERY_ENDPOINTS)}."
+                )
+        return v
+
+    @field_validator("request_id")
+    @classmethod
+    def _require_uuid_format(cls, v):
+        # Same reasoning as the endpoint allowlist above, by shape rather
+        # than by enumeration: every real request_id is a str(uuid.uuid4())
+        # from main.py's middleware, and a UUID is hex digits and dashes
+        # only -- no quote, no backslash. Validating the shape makes the
+        # interpolation into '$d.request_id == '{rid}'' provably safe
+        # rather than denylist-safe.
+        #
+        # This does reject the literal "unknown" that handlers fall back to
+        # via getattr(request.state, "request_id", "unknown"). That fallback
+        # should never fire (the middleware sets state before call_next),
+        # and such an entry could not correlate to a real request anyway.
+        if v is None:
+            return v
+        candidates = [v] if isinstance(v, str) else v
+        for rid in candidates:
+            if not _UUID_RE.match(rid):
+                raise ValueError(
+                    f"request_id {rid!r} is not a UUID. Use the value from "
+                    "the X-Request-ID response header or the response body."
+                )
+        return v
 
     @field_validator("start_time", "end_time")
     @classmethod
@@ -383,6 +535,12 @@ class LogsQueryRequest(BaseModel):
 class LogsResponse(BaseModel):
     """Response structure for the logs endpoint."""
 
+    # Mirrors PredictResponse.request_id -- see the comment there. Note the
+    # dict returned by fetch_and_format_logs also carries "query_executed",
+    # which this model deliberately omits and FastAPI therefore strips: the
+    # generated DataPrime query is an internal detail, not part of the
+    # response contract.
+    request_id: Optional[str] = None
     time_window: Dict[str, str]
     log_count: int
     logs: List[Dict[str, Any]]

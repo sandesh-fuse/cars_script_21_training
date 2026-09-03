@@ -164,6 +164,7 @@ class Script21Pipeline:
                 request_dict=request_dict,
                 k_pos=k_pos,
                 k_neg=k_neg,
+                is_cult=is_cult,
             )
             shap_payload["quantile_explained"] = shap_quantile
             result["shap"] = shap_payload
